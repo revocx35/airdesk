@@ -1,0 +1,49 @@
+# Airdesk (map + airband + data messages) and SpySwitch (who may use the SpyServers).
+# Both use the host network: SpySwitch takes over the SpyServer ports on this machine, and the
+# SpyServers themselves move to ports only reachable from here (see README).
+services:
+  spyswitch:
+    image: ghcr.io/revocx35/spyswitch:latest
+    build:
+      context: .
+      dockerfile: spyswitch/Dockerfile
+      target: app
+    container_name: spyswitch
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      SPYSWITCH_SERVERS: ${SPYSWITCH_SERVERS:-VHF/UHF@5555=127.0.0.1:15555; HF@5556=127.0.0.1:15556}
+      SPYSWITCH_HTTP_PORT: ${SPYSWITCH_HTTP_PORT:-8096}
+      SPYSWITCH_DEFAULT_ALLOW: ${SPYSWITCH_DEFAULT_ALLOW:-true}
+      SPYSWITCH_TRUSTED_PROXIES: ${SPYSWITCH_TRUSTED_PROXIES:-private}
+      SPYSWITCH_ADMIN_USER: ${SPYSWITCH_ADMIN_USER:-}
+      SPYSWITCH_ADMIN_PASSWORD: ${SPYSWITCH_ADMIN_PASSWORD:-}
+    volumes:
+      - spyswitch-data:/data
+
+  airdesk:
+    image: ghcr.io/revocx35/airdesk:latest
+    build:
+      context: .
+      dockerfile: airdesk/Dockerfile
+      target: app
+    container_name: airdesk
+    restart: unless-stopped
+    network_mode: host
+    depends_on: [spyswitch]
+    environment:
+      AIRDESK_READSB_URL: ${AIRDESK_READSB_URL:-http://192.168.1.20/tar1090}     # your tar1090, read only
+      AIRDESK_SPYSERVER_HOST: ${AIRDESK_SPYSERVER_HOST:-127.0.0.1}
+      AIRDESK_SPYSERVER_PORT: ${AIRDESK_SPYSERVER_PORT:-5555}
+      AIRDESK_RECEIVER_LAT: ${AIRDESK_RECEIVER_LAT:-}
+      AIRDESK_RECEIVER_LON: ${AIRDESK_RECEIVER_LON:-}
+      AIRDESK_HTTP_PORT: ${AIRDESK_HTTP_PORT:-8097}
+      AIRDESK_TRUSTED_PROXIES: ${AIRDESK_TRUSTED_PROXIES:-private}
+      AIRDESK_ADMIN_USER: ${AIRDESK_ADMIN_USER:-}
+      AIRDESK_ADMIN_PASSWORD: ${AIRDESK_ADMIN_PASSWORD:-}
+    volumes:
+      - airdesk-data:/data
+
+volumes:
+  spyswitch-data:
+  airdesk-data:

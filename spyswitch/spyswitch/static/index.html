@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SpySwitch</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='1' y='5' width='14' height='6' rx='3' fill='%2319807a'/%3E%3Ccircle cx='11' cy='8' r='2.2' fill='%23fff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="name">SpySwitch</span><span class="sub">who is using the radio</span></div>
+  <div class="account">
+    <span id="who" class="muted"></span>
+    <button type="button" id="logout">Sign out</button>
+  </div>
+</header>
+<main class="wrap">
+  <section aria-labelledby="h-servers">
+    <h2 id="h-servers">Servers</h2>
+    <div id="servers" class="servers"></div>
+  </section>
+
+  <section aria-labelledby="h-apps">
+    <div class="section-head">
+      <h2 id="h-apps">Apps</h2>
+      <label class="check"><input type="checkbox" id="default-allow"> Let new apps connect</label>
+    </div>
+    <p class="hint">An app that is switched off is disconnected and refused until you switch it back on. Apps are told apart by the name they send and their address.</p>
+    <div class="table-wrap">
+      <table id="apps">
+        <thead><tr><th>Allowed</th><th>App</th><th>Address</th><th>Status</th><th>Last seen</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p id="no-apps" class="hint" hidden>No app has connected yet.</p>
+  </section>
+
+  <section aria-labelledby="h-events">
+    <h2 id="h-events">Recent events</h2>
+    <ol id="events" class="events"></ol>
+  </section>
+  <p id="message" class="message" role="status"></p>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>

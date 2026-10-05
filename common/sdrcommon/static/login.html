@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in · {{APP}}</title>
+<link rel="stylesheet" href="/auth/login.css">
+</head>
+<body>
+<main class="box">
+  <p class="app">{{APP}}</p>
+  <form id="login" class="card" autocomplete="on">
+    <h1>Sign in</h1>
+    <label>Username <input id="username" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required maxlength="64"></label>
+    <label>Password <input id="password" name="password" type="password" autocomplete="current-password" required maxlength="1024"></label>
+    <button type="submit" id="submit">Sign in</button>
+    <p id="error" class="error" role="alert"></p>
+  </form>
+  <div id="setup" class="card" hidden>
+    <h1>No accounts yet</h1>
+    <p>Create the first account on the machine running {{APP}}:</p>
+    <pre id="setup-cmd">docker compose exec SERVICE python -m sdrcommon.users add NAME</pre>
+  </div>
+</main>
+<script src="/auth/login.js"></script>
+</body>
+</html>
