@@ -10,13 +10,12 @@ Both are Python, run in Docker, and need a sign-in.
 ## What Airdesk uses
 
 - **Plane data** from an existing [readsb](https://github.com/wiedehopf/readsb)/[tar1090](https://github.com/wiedehopf/tar1090) installation, read over HTTP (`/data/aircraft.json`). Nothing is changed there. Registration and type come from tar1090's own aircraft database files.
-- **Radio** from a SpyServer, normally through SpySwitch. An RTL-SDR covers about 2 MHz at a time, so Airdesk works on a *window*: every channel inside it is decoded at once.
-  - Voice channels are AM-demodulated with a squelch that follows the noise floor. Listen live in the browser, and replay recent transmissions.
-  - **ACARS** (131.525/131.725/131.825 MHz) is decoded by Airdesk itself.
-  - **VDL2** (136.725–136.975 MHz) is decoded by [dumpvdl2](https://github.com/szpajder/dumpvdl2), which is built into the image.
-  - *Heard recently* lists frequencies in the window that carried signals, so you can find the active channels near you and add them.
-
-Presets: **VDL2** (window around 136.4 MHz: VDL2 plus upper airband voice) and **ACARS** (around 131.2 MHz: ACARS plus 130–132 MHz voice). You can also type any centre frequency.
+- **Radio** from a SpyServer, normally through SpySwitch. An RTL-SDR hears about 2 MHz at a time, so Airdesk works on a *window* and decodes every channel inside it at once.
+  - **Scan airband** (the default) sweeps 118–137 MHz in ten 1.9 MHz segments. Each segment gets an *activeness* score (voice transmissions per hour of listening), and listening time is shared in proportion to it, so busy parts of the band are visited most while quiet ones are still checked. A dwell lasts about 10 s, longer while a conversation is going on, and never ends in the middle of a transmission. Listening to a channel holds the scanner on it.
+  - **Voice channels are found automatically**: a signal on the 8.33 kHz raster that lasts at least 0.7 s with speech-like level changes becomes a channel (data bursts are too short, plain carriers do not move). Its first transmission is already recorded. A found channel that stays silent for a day is marked dead; channels you add yourself, or pin, stay.
+  - **Every voice transmission is recorded** (8 kHz, about 8 kB per second of speech) and kept for a week. The *Channels* tab lists live and dead channels with their activeness, a timeline of transmissions with the times the radio was listening, and the recordings.
+  - **Fixed window** stays on one window instead, with presets for VDL2 and ACARS.
+  - **ACARS** (131.525/131.725/131.825 MHz) is decoded by Airdesk itself; **VDL2** (136.725–136.975 MHz) by [dumpvdl2](https://github.com/szpajder/dumpvdl2), built into the image. While scanning, both are decoded whenever the scanner is on their segment.
 
 ## Set up
 
@@ -43,6 +42,8 @@ Presets: **VDL2** (window around 136.4 MHz: VDL2 plus upper airband voice) and *
 | `AIRDESK_RECEIVER_LAT` / `_LON` | – | Your antenna, for distances and the starting map view |
 | `SPYSWITCH_SERVERS` | `VHF/UHF@5555=127.0.0.1:15555; HF@5556=127.0.0.1:15556` | `NAME@LISTEN_PORT=SPYSERVER_HOST:PORT`, separated by `;` |
 | `SPYSWITCH_DEFAULT_ALLOW` | `true` | Whether an app SpySwitch has never seen may connect |
+| `AIRDESK_RECORDING_DAYS` | `7` | How long recordings are kept |
+| `AIRDESK_RECORDING_MAX_MB` | `4000` | Upper limit for all recordings; the oldest go first |
 | `AIRDESK_TILE_URL` / `_ATTRIBUTION` | OpenStreetMap | Map tiles (a Leaflet URL template) and their credit line |
 | `AIRDESK_TILE_DARK_FILTER` | `true` | Darken light tiles when the browser is in dark mode |
 | `*_HTTP_PORT` | `8097` / `8096` | Web ports |
@@ -82,6 +83,6 @@ The suites use a fake SpyServer that plays synthetic airband scenes (AM voice, A
 
 ## Notes
 
-Receiving airband traffic is legal in many places but not everywhere, and recording or sharing it often is not. Check your local rules. Airdesk keeps recent transmissions in memory only; turn that off under *Transmissions*.
+Receiving airband traffic is legal in many places but not everywhere, and recording or sharing it often is not. Check your local rules. Airdesk records voice transmissions for a week by default; switch *Record* off on the Radio tab, or shorten `AIRDESK_RECORDING_DAYS`.
 
 Third-party code: [Leaflet](https://leafletjs.com) 1.9.4 (BSD-2-Clause, bundled under `airdesk/airdesk/static/vendor/leaflet`), and in the Airdesk image [dumpvdl2](https://github.com/szpajder/dumpvdl2) v2.7.0 (GPL-3.0) with [libacars](https://github.com/szpajder/libacars) v2.2.1 (MIT), built from those tags (see `airdesk/Dockerfile`). Map tiles © OpenStreetMap contributors by default; heavy use should go to your own or a commercial tile server ([OSM tile policy](https://operations.osmfoundation.org/policies/tiles/)).

@@ -88,9 +88,10 @@ function altColor(alt) {
 // state
 // ---------------------------------------------------------------------------------------------
 const S = {
-  aircraft: new Map(), trails: new Map(), markers: new Map(), messages: [], clips: [], state: null,
+  aircraft: new Map(), trails: new Map(), markers: new Map(), messages: [], recent: [], state: null,
   selected: null, follow: false, fitted: false, sort: { key: "dist", dir: 1 }, msgSource: "",
   listen: new Set(), spectrum: null, ws: null,
+  channels: [], chStatus: "alive", chSelected: null, chHours: 24, chHistory: null, chBucket: null,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -306,29 +307,56 @@ const HEADPHONES = "M12 3a8 8 0 0 0-8 8v6a3 3 0 0 0 3 3h1v-8H6v-1a6 6 0 0 1 12 0
 let chanKey = "";
 const meterEls = new Map();
 
+function fmtBytes(b) {
+  return b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : b >= 1e6 ? `${(b / 1e6).toFixed(0)} MB` : `${Math.round(b / 1e3)} kB`;
+}
+function fmtDur(s) {
+  if (s < 60) return `${s.toFixed(s < 10 ? 1 : 0)} s`;
+  const m = Math.floor(s / 60);
+  return m < 60 ? `${m} min ${Math.round(s % 60)} s` : `${Math.floor(m / 60)} h ${m % 60} min`;
+}
+
+function listenButton(id, label, enabled = true) {
+  return h("button", { type: "button", class: "listen", "aria-pressed": String(S.listen.has(id)), disabled: !enabled,
+    "aria-label": `Listen to ${label}`, title: S.listen.has(id) ? "Stop listening" : "Listen live",
+    onclick: (e) => { e.stopPropagation(); toggleListen(id); } },
+  svg("svg", { viewBox: "0 0 24 24", fill: "currentColor" }, svg("path", { d: HEADPHONES })));
+}
+
 function renderRadio(r) {
   const pill = h("span", { class: `pill ${r.state}`, text: r.state });
-  $("r-state").replaceChildren(pill, document.createTextNode(r.state === "running" ? `${mhz(r.config.center_hz)} MHz` : ""));
+  $("r-state").replaceChildren(pill, document.createTextNode(r.state === "running" ? `${mhz((r.window[0] + r.window[1]) / 2)} MHz` : ""));
   $("r-device").textContent = r.device || "";
   $("r-message").textContent = r.message || "";
   const on = r.config.running;
   $("r-toggle").textContent = on ? "Stop radio" : "Start radio";
   $("r-toggle").classList.toggle("primary", !on);
+  const scan = r.config.mode === "scan";
+  for (const b of $("mode").querySelectorAll("button")) b.setAttribute("aria-pressed", String(b.dataset.mode === r.config.mode));
+  $("scan-box").hidden = !scan;
+  $("fixed-box").hidden = scan;
   if (document.activeElement !== $("r-center")) $("r-center").value = mhz(r.config.center_hz);
   if (document.activeElement !== $("r-gain")) { $("r-gain").value = r.config.gain; $("r-gain-out").textContent = r.config.gain; }
   $("keep-clips").checked = r.config.keep_clips;
+  $("rec-usage").textContent = `${fmtBytes(r.recordings.bytes)} of recordings, kept for ${r.recordings.days} days.`;
   $("r-window").textContent = `${mhz(r.window[0], 2)}–${mhz(r.window[1], 2)} MHz`;
   $("n-live").hidden = !(r.state === "running" && r.channels.some((c) => c.open));
+  $("n-chans").textContent = r.counts.alive || "";
+  if (scan) renderScan(r);
 
-  const voice = r.channels.filter((c) => c.kind === "voice");
+  const voice = r.channels.filter((c) => c.kind === "voice" && c.inside);
   const data = r.channels.filter((c) => c.kind !== "voice");
-  const key = JSON.stringify([voice.map((c) => [c.id, c.label, c.freq_hz, c.inside]), data.map((c) => [c.id, c.inside]), [...S.listen]]);
+  const key = JSON.stringify([voice.map((c) => [c.id, c.label, c.freq_hz]), data.map((c) => [c.id, c.inside]), [...S.listen]]);
   if (key !== chanKey) {
     chanKey = key;
     meterEls.clear();
     $("voice-list").replaceChildren(...voice.map(voiceRow));
     $("data-list").replaceChildren(...data.map(dataRow));
-    if (!voice.length) $("voice-list").append(h("li", { class: "hint", text: "No voice channels yet. Add one below, or pick a frequency from Heard recently." }));
+    if (!voice.length) {
+      $("voice-list").append(h("li", { class: "hint", text: r.state === "running"
+        ? "No known voice channels in this window yet. New ones are added as soon as someone talks."
+        : "Start the radio to listen." }));
+    }
   }
   for (const c of r.channels) {
     const m = meterEls.get(c.id);
@@ -338,29 +366,61 @@ function renderRadio(r) {
   }
   const v = r.vdl2;
   $("vdl2-note").textContent = !v.available ? "VDL2 needs dumpvdl2, which is not installed in this container."
-    : v.enabled ? `VDL2 decoder running on ${v.freqs.map((f) => mhz(f)).join(", ")} MHz · ${v.decoded} frames decoded${v.dropped ? ` · ${v.dropped} blocks dropped (CPU busy)` : ""}`
-    : "Move the window to 136.2–137.0 MHz (VDL2 preset) to decode VDL2.";
-  $("activity").replaceChildren(...r.activity.slice(0, 16).map((a) => {
-    const known = r.channels.find((c) => Math.abs(c.freq_hz - a.freq_hz) < 6e3);
-    return h("li", {}, h("button", {
-      type: "button", title: known ? `${known.label || "Channel"} · last ${fmtAgo(a.last)}` : `Add ${mhz(a.freq_hz)} MHz as a channel`,
-      onclick: () => { if (!known) { $("add-freq").value = mhz(a.freq_hz); $("add-label").focus(); } },
-    }, mhz(a.freq_hz), h("small", { text: known ? (known.label || known.kind.toUpperCase()) : `${a.count}×` })));
-  }));
-  if (!r.activity.length) $("activity").append(h("li", { class: "hint", text: r.state === "running" ? "Listening… frequencies with signals show up here." : "Start the radio to look for activity." }));
+    : v.enabled ? `VDL2 decoder running on ${v.freqs.map((f) => mhz(f)).join(", ")} MHz · ${v.decoded} messages${v.dropped ? ` · ${v.dropped} blocks dropped (CPU busy)` : ""}`
+    : scan ? "VDL2 and ACARS are decoded while the scanner is on their segments." : "Move the window to 136.2–137.0 MHz (VDL2 preset) to decode VDL2.";
+}
+
+let segEls = [];
+function renderScan(r) {
+  const sc = r.scanner, segs = sc.segments;
+  const cur = segs.find((s) => s.idx === sc.current);
+  $("scan-status").replaceChildren(...(r.state !== "running"
+    ? [document.createTextNode("Start the radio to scan the airband.")]
+    : cur ? [document.createTextNode("Listening to "), h("b", { text: `${mhz(cur.lo, 1)}–${mhz(cur.hi, 1)} MHz` }),
+      document.createTextNode(` for ${Math.round(sc.dwell_s)} s${sc.holding ? " · held while you listen" : ""}`)]
+      : [document.createTextNode("Moving…")]));
+  if (segEls.length !== segs.length) {
+    segEls = segs.map((s) => {
+      const fill = h("span", { class: "fill" });
+      const el = h("div", { class: "seg", role: "listitem", tabindex: "0" }, fill);
+      const show = () => showSegTip(el, s.idx);
+      el.addEventListener("pointerenter", show);
+      el.addEventListener("focus", show);
+      el.addEventListener("pointerleave", () => { $("scan-tip").hidden = true; });
+      el.addEventListener("blur", () => { $("scan-tip").hidden = true; });
+      return { el, fill };
+    });
+    $("scan-strip").replaceChildren(...segEls.map((x) => x.el));
+  }
+  const maxShare = Math.max(...segs.map((s) => s.share), 1e-9);
+  segs.forEach((s, i) => {
+    const { el, fill } = segEls[i];
+    fill.style.opacity = String(0.12 + 0.88 * (s.share / maxShare));     // one hue, light to dark with share
+    el.classList.toggle("cur", s.idx === sc.current && r.state === "running");
+    el.setAttribute("aria-label", `${mhz(s.lo, 1)} to ${mhz(s.hi, 1)} MHz: ${s.rate} transmissions per hour, ${Math.round(s.share * 100)} % of listening time`);
+  });
+}
+
+function showSegTip(el, idx) {
+  const s = S.state && S.state.radio.scanner.segments.find((x) => x.idx === idx);
+  if (!s) return;
+  const tip = $("scan-tip");
+  tip.replaceChildren(h("strong", { text: `${fmtNum(s.rate, 1)} transmissions / h` }),
+    h("span", { text: `${mhz(s.lo, 1)}–${mhz(s.hi, 1)} MHz` }),
+    h("span", { text: `${Math.round(s.share * 100)} % of listening time` }),
+    h("span", { text: s.last_visit ? `last visit ${fmtAgo(s.last_visit)}` : "not visited yet" }));
+  tip.hidden = false;
+  const box = $("scan-box").getBoundingClientRect(), r = el.getBoundingClientRect();
+  tip.style.left = `${Math.max(0, Math.min(r.left - box.left, box.width - tip.offsetWidth))}px`;
+  tip.style.top = `${r.bottom - box.top + 10}px`;
 }
 
 function voiceRow(c) {
-  const listening = S.listen.has(c.id);
   const bar = h("span");
-  const btn = h("button", { type: "button", class: "listen", "aria-pressed": String(listening), disabled: !c.inside,
-    "aria-label": `Listen to ${c.label || mhz(c.freq_hz)}`, onclick: () => toggleListen(c.id) },
-  svg("svg", { viewBox: "0 0 24 24", fill: "currentColor" }, svg("path", { d: HEADPHONES })));
-  const del = h("button", { type: "button", class: "ghost small", "aria-label": `Remove ${c.label || mhz(c.freq_hz)}`, text: "✕",
-    onclick: () => act(`/api/channels/${encodeURIComponent(c.id)}`, undefined, "DELETE") });
-  const row = h("li", { class: `chan${c.inside ? "" : " outside"}` }, btn,
-    h("div", {}, h("span", { class: "name", text: c.label || "Voice" }), " ", h("span", { class: "freq", text: `${mhz(c.freq_hz)} MHz${c.inside ? "" : " · outside window"}` })),
-    h("div", { class: "tools" }, del), h("div", { class: "meter" }, bar));
+  const name = c.source === "provisional" ? "New channel?" : (c.label || "Voice");
+  const row = h("li", { class: "chan" }, listenButton(c.id, name, c.source !== "provisional"),
+    h("div", {}, h("span", { class: "name", text: name }), " ", h("span", { class: "freq", text: `${mhz(c.freq_hz)} MHz` })),
+    h("div", { class: "tools" }), h("div", { class: "meter" }, bar));
   meterEls.set(c.id, { bar, row });
   return row;
 }
@@ -369,7 +429,7 @@ function dataRow(c) {
   const bar = h("span");
   const row = h("li", { class: `chan ${c.kind}${c.inside ? "" : " outside"}` },
     h("span", { class: `kind ${c.kind}`, text: c.kind.toUpperCase() }),
-    h("div", {}, h("span", { class: "freq", text: `${mhz(c.freq_hz)} MHz${c.inside ? "" : " · outside window"}` })),
+    h("div", {}, h("span", { class: "freq", text: `${mhz(c.freq_hz)} MHz${c.inside ? "" : " · not in window"}` })),
     h("div", {}), h("div", { class: "meter" }, bar));
   meterEls.set(c.id, { bar, row });
   return row;
@@ -412,16 +472,234 @@ function drawSpectrum() {
   }
   g.fillStyle = col("--muted");
   g.font = `10px ${col("--mono")}`;
-  const ticks = [lo + span * 0.1, sp.center_hz, lo + span * 0.9];
-  ticks.forEach((t, i) => {
-    const label = mhz(t, 2);
-    const tw = g.measureText(label).width;
+  [lo + span * 0.1, sp.center_hz, lo + span * 0.9].forEach((t, i) => {
+    const label = mhz(t, 2), tw = g.measureText(label).width;
     g.fillText(label, i === 0 ? x(t) : i === 2 ? x(t) - tw : x(t) - tw / 2, ht - 2);
   });
 }
 
 // ---------------------------------------------------------------------------------------------
-// audio: live listening and recorded transmissions
+// channels: list, details, transmission timeline
+// ---------------------------------------------------------------------------------------------
+let chTimer = null;
+function scheduleChannels(delay = 2500) {
+  if (chTimer) return;
+  chTimer = setTimeout(() => { chTimer = null; if (!$("pane-channels").hidden) loadChannels(); }, delay);
+}
+
+async function loadChannels() {
+  try { S.channels = await api("/api/channels"); } catch { return; }
+  renderChannels();
+  if (S.chSelected) loadHistory();
+}
+
+function sparkline(counts) {
+  const max = Math.max(...counts, 1), w = 72, ht = 18, bw = w / counts.length;
+  return svg("svg", { class: "sparkline", width: w, height: ht, viewBox: `0 0 ${w} ${ht}`, "aria-hidden": "true" },
+    ...counts.map((c, i) => {
+      const bh = c ? Math.max(2, (c / max) * ht) : 1;
+      return svg("rect", { x: (i * bw + 0.5).toFixed(1), y: (ht - bh).toFixed(1), width: (bw - 1).toFixed(1), height: bh.toFixed(1),
+        class: i === counts.length - 1 ? "now" : "" });
+    }));
+}
+
+function renderChannels() {
+  const q = $("ch-search").value.trim().toLowerCase();
+  const alive = S.channels.filter((c) => c.status === "alive"), dead = S.channels.filter((c) => c.status === "dead");
+  $("n-alive").textContent = alive.length || "";
+  $("n-dead").textContent = dead.length || "";
+  let rows = S.chStatus === "all" ? S.channels : S.chStatus === "alive" ? alive : dead;
+  if (q) rows = rows.filter((c) => (c.label || "").toLowerCase().includes(q) || mhz(c.freq_hz).includes(q));
+  rows = [...rows].sort((a, b) => (a.status === b.status ? 0 : a.status === "alive" ? -1 : 1) || b.rate - a.rate ||
+    (b.last_heard || 0) - (a.last_heard || 0));
+  const views = new Map(((S.state && S.state.radio.channels) || []).map((v) => [v.id, v]));
+  $("ch-list").replaceChildren(...rows.map((c) => {
+    const name = c.label || "Unnamed";
+    const live = views.get(c.id);
+    const row = h("li", { class: `ch-row${c.id === S.chSelected ? " sel" : ""}${c.status === "dead" ? " dead" : ""}${live && live.open ? " open" : ""}`,
+      tabindex: "0", onclick: () => selectChannel(c.id), onkeydown: (e) => { if (e.key === "Enter") selectChannel(c.id); } },
+    c.status === "alive" ? listenButton(c.id, name) : h("span"),
+    h("div", {}, h("span", { class: "name", text: name }),
+      c.status === "dead" ? h("span", { class: "tag dead", text: "dead" }) : null,
+      c.pinned ? h("span", { class: "tag pinned", text: "pinned" }) : c.source === "detected" ? h("span", { class: "tag", text: "found" }) : null),
+    h("div", { class: "spark" }, h("span", { class: "rate" }, fmtNum(c.rate, 1), h("small", { text: " /h" })), sparkline(c.last_24h)),
+    h("div", { class: "meta" }, h("span", { text: `${mhz(c.freq_hz)} MHz` }),
+      h("span", { text: c.last_heard ? `heard ${fmtAgo(c.last_heard)}` : "not heard yet" }),
+      h("span", { text: `${c.tx_24h} in 24 h` })));
+    return row;
+  }));
+  $("ch-empty").hidden = rows.length > 0;
+  $("ch-detail").hidden = !S.chSelected;
+}
+
+function selectChannel(id) {
+  S.chSelected = id;
+  S.chBucket = null;
+  S.chHistory = null;
+  renderChannels();
+  loadHistory();
+}
+
+async function loadHistory() {
+  const id = S.chSelected;
+  if (!id) return;
+  try {
+    const hist = await api(`/api/channels/${encodeURIComponent(id)}/history?hours=${S.chHours}`);
+    if (id !== S.chSelected) return;
+    S.chHistory = hist;
+  } catch (e) {
+    if (/No such channel/.test(e.message)) { S.chSelected = null; renderChannels(); }
+    return;
+  }
+  renderDetail();
+}
+
+function renderDetail() {
+  const hist = S.chHistory;
+  if (!hist) return;
+  const c = hist.channel;
+  if (document.activeElement !== $("d-label")) $("d-label").value = c.label || "";
+  $("d-sub").textContent = `${mhz(c.freq_hz)} MHz · ${c.source === "detected" ? "found by the scanner" : "added by hand"}${c.status === "dead" ? " · no transmissions for over a day" : ""}`;
+  $("d-pin").setAttribute("aria-pressed", String(!!c.pinned));
+  $("d-pin").textContent = c.pinned ? "Pinned" : "Pin";
+  $("d-pin").title = c.pinned ? "Kept even when silent" : "Keep this channel even if it goes silent for a day";
+  $("d-listen").setAttribute("aria-pressed", String(S.listen.has(c.id)));
+  $("d-listen").textContent = S.listen.has(c.id) ? "Stop listening" : "Listen";
+  $("d-listen").disabled = c.status !== "alive";
+  const n = hist.transmissions.length;
+  $("d-stats").replaceChildren(
+    fact("Activeness", `${fmtNum(c.rate, 1)} / h`), fact(S.chHours > 24 ? "In 7 days" : "In 24 h", String(n)),
+    fact("Last heard", c.last_heard ? fmtAgo(c.last_heard) : "never"),
+    fact("Listened", fmtDur(c.listened_s)), fact("All time", String(c.tx_count)), fact("Status", c.status));
+  for (const b of $("d-range").querySelectorAll("button")) b.setAttribute("aria-pressed", String(Number(b.dataset.hours) === S.chHours));
+  $("d-chart-title").textContent = S.chHours > 24 ? "Transmissions per 2 hours" : "Transmissions per 30 minutes";
+  drawTimeline();
+  renderDetailRecordings();
+}
+
+function bucketing() {
+  const hist = S.chHistory, size = S.chHours > 24 ? 7200 : 1800, n = Math.round(S.chHours * 3600 / size);
+  const end = Math.ceil(hist.until / size) * size, start = end - n * size;
+  const counts = Array(n).fill(0), talk = Array(n).fill(0), cover = Array(n).fill(0);
+  for (const t of hist.transmissions) {
+    const i = Math.floor((t.start - start) / size);
+    if (i >= 0 && i < n) { counts[i]++; talk[i] += t.duration; }
+  }
+  for (const [a, b] of hist.coverage) {
+    for (let i = Math.max(0, Math.floor((a - start) / size)); i < n && start + i * size < b; i++) {
+      const lo = Math.max(a, start + i * size), hi = Math.min(b, start + (i + 1) * size);
+      if (hi > lo) cover[i] += (hi - lo) / size;
+    }
+  }
+  return { size, n, start, end, counts, talk, cover };
+}
+
+function niceStep(max) {
+  if (max <= 4) return 1;
+  const raw = max / 3, p = 10 ** Math.floor(Math.log10(raw));
+  return [1, 2, 5, 10].map((m) => m * p).find((s) => s >= raw);
+}
+
+function drawTimeline() {
+  const box = $("d-chart");
+  const W = Math.max(260, box.clientWidth || 360), H = 156;
+  const B = bucketing();
+  const pad = { l: 28, r: 6, t: 10, b: 38 }, pw = W - pad.l - pad.r, ph = H - pad.t - pad.b, bw = pw / B.n;
+  const step = niceStep(Math.max(...B.counts, 1)), top = Math.max(step, Math.ceil(Math.max(...B.counts, 1) / step) * step);
+  const y = (v) => pad.t + ph - (v / top) * ph, xt = (t) => pad.l + ((t - B.start) / (B.end - B.start)) * pw;
+  const root = svg("svg", { viewBox: `0 0 ${W} ${H}`, height: H, role: "group", "aria-label": $("d-chart-title").textContent });
+  for (let v = 0; v <= top; v += step) {
+    root.append(svg("line", { class: "grid", x1: pad.l, x2: W - pad.r, y1: y(v), y2: y(v) }),
+      svg("text", { class: "tick", x: pad.l - 6, y: y(v) + 3, "text-anchor": "end" }, document.createTextNode(String(v))));
+  }
+  const barW = Math.min(24, Math.max(1, bw - 2));                  // 2 px surface gap between neighbours
+  for (let i = 0; i < B.n; i++) {
+    const g = svg("g", { class: `b${S.chBucket === i ? " picked" : ""}`, tabindex: "0", role: "button",
+      "aria-label": `${tipLabel(B, i)}: ${B.counts[i]} transmissions` });
+    g.append(svg("rect", { class: "hit", x: pad.l + i * bw, y: pad.t, width: bw, height: ph }));
+    if (B.counts[i]) {
+      const x0 = pad.l + i * bw + (bw - barW) / 2, y0 = y(B.counts[i]), y1 = y(0), r = Math.min(4, barW / 2, y1 - y0);
+      g.append(svg("path", { class: "bar", d: `M${x0},${y1}V${y0 + r}Q${x0},${y0} ${x0 + r},${y0}H${x0 + barW - r}Q${x0 + barW},${y0} ${x0 + barW},${y0 + r}V${y1}Z` }));
+    }
+    const show = () => showChartTip(B, i, pad.l + (i + 0.5) * bw, W);
+    g.addEventListener("pointerenter", show);
+    g.addEventListener("focus", show);
+    g.addEventListener("pointerleave", hideChartTip);
+    g.addEventListener("blur", hideChartTip);
+    g.addEventListener("click", () => pickBucket(i));
+    g.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pickBucket(i); } });
+    root.append(g);
+  }
+  const cy = pad.t + ph + 6;                                         // listening coverage under the axis
+  root.append(svg("rect", { class: "covbg", x: pad.l, y: cy, width: pw, height: 4, rx: 2 }));
+  for (const [a, b] of S.chHistory.coverage) {
+    const x0 = xt(Math.max(a, B.start)), x1 = xt(Math.min(b, B.end));
+    if (x1 > x0) root.append(svg("rect", { class: "cov", x: x0, y: cy, width: Math.max(1, x1 - x0), height: 4, rx: 1 }));
+  }
+  const labels = [];
+  if (S.chHours <= 24) {
+    for (let t = Math.ceil(B.start / 21600) * 21600; t <= B.end; t += 21600) labels.push([t, new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })]);
+  } else {
+    const d = new Date(B.start * 1000); d.setHours(24, 0, 0, 0);
+    for (let t = d.getTime() / 1000; t < B.end; t += 86400) labels.push([t, new Date(t * 1000).toLocaleDateString([], { weekday: "short" })]);
+  }
+  for (const [t, text] of labels) {
+    const x = xt(t);
+    if (x < pad.l + 8 || x > W - pad.r - 8) continue;
+    root.append(svg("text", { class: "tick", x, y: H - 8, "text-anchor": "middle" }, document.createTextNode(text)));
+  }
+  if (!B.counts.some(Boolean)) {
+    root.append(svg("text", { class: "empty", x: pad.l + pw / 2, y: pad.t + ph / 2, "text-anchor": "middle" },
+      document.createTextNode("No transmissions in this period")));
+  }
+  const tip = h("div", { id: "chart-tip", class: "tooltip", role: "tooltip", hidden: true });
+  box.replaceChildren(root, tip);
+}
+
+function tipLabel(B, i) {
+  const a = new Date((B.start + i * B.size) * 1000), b = new Date((B.start + (i + 1) * B.size) * 1000);
+  const t = (d) => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return `${S.chHours > 24 ? `${a.toLocaleDateString([], { weekday: "short" })} ` : ""}${t(a)}–${t(b)}`;
+}
+
+function showChartTip(B, i, x, W) {
+  const tip = $("chart-tip");
+  if (!tip) return;
+  const cov = Math.min(1, B.cover[i]);
+  tip.replaceChildren(h("strong", { text: `${B.counts[i]} transmission${B.counts[i] === 1 ? "" : "s"}` }),
+    h("span", { text: tipLabel(B, i) }),
+    B.counts[i] ? h("span", { text: `${fmtDur(B.talk[i])} of talk` }) : null,
+    h("span", { text: cov > 0 ? `listened ${Math.round(cov * 100)} % of the time` : "not listened to" }));
+  tip.hidden = false;
+  tip.style.left = `${Math.max(0, Math.min(x - tip.offsetWidth / 2, W - tip.offsetWidth))}px`;
+  tip.style.top = "0px";
+}
+function hideChartTip() { const t = $("chart-tip"); if (t) t.hidden = true; }
+
+function pickBucket(i) {
+  S.chBucket = S.chBucket === i ? null : i;
+  drawTimeline();
+  renderDetailRecordings();
+}
+
+function renderDetailRecordings() {
+  const hist = S.chHistory;
+  let list = hist.transmissions;
+  const B = bucketing();
+  if (S.chBucket !== null) {
+    const a = B.start + S.chBucket * B.size, b = a + B.size;
+    list = list.filter((t) => t.start >= a && t.start < b);
+    $("d-rec-filter").textContent = `Showing ${tipLabel(B, S.chBucket)}`;
+  }
+  $("d-rec-filter").hidden = S.chBucket === null;
+  $("d-showall").hidden = S.chBucket === null;
+  const withDay = S.chHours > 24;
+  $("d-recs").replaceChildren(...list.slice(0, 300).map((t) => recordingItem(t, null, withDay)));
+  $("d-recs-empty").hidden = list.length > 0;
+}
+
+// ---------------------------------------------------------------------------------------------
+// audio: live listening and recordings
 // ---------------------------------------------------------------------------------------------
 let audioCtx = null, gainNode = null, playAt = 0;
 function ensureAudio() {
@@ -454,31 +732,46 @@ function toggleListen(id) {
   ensureAudio();
   if (S.listen.has(id)) S.listen.delete(id); else S.listen.add(id);
   if (S.ws && S.ws.readyState === 1) S.ws.send(JSON.stringify({ listen: [...S.listen] }));
+  chanKey = "";
   if (S.state) renderRadio(S.state.radio);
+  renderChannels();
+  if (S.chHistory) renderDetail();
 }
 
 let playing = null;
-function renderClips() {
-  const labels = new Map(((S.state && S.state.radio.channels) || []).map((c) => [c.id, c.label]));
-  $("clips").replaceChildren(...S.clips.slice(0, 120).map((c) => {
-    const btn = h("button", { type: "button", class: "small", text: playing && playing.id === c.id ? "■" : "▶",
-      "aria-label": `Play transmission at ${fmtClock(c.start)}`, onclick: () => playClip(c) });
-    return h("li", { class: `clip${playing && playing.id === c.id ? " playing" : ""}` },
-      h("time", { text: fmtClock(c.start) }),
-      h("span", { class: "what" }, labels.get(c.channel) || "Voice", h("small", { text: `${mhz(c.freq_hz)} · ${c.duration.toFixed(1)} s` })),
-      btn);
-  }));
-  $("clips-empty").hidden = S.clips.length > 0;
+function recordingItem(t, label, withDay = false) {
+  const isPlaying = playing && playing.id === t.id;
+  const when = new Date(t.start * 1000);
+  const btn = h("button", { type: "button", class: "small", text: isPlaying ? "■" : "▶", disabled: !t.id,
+    "aria-label": `${isPlaying ? "Stop" : "Play"} recording from ${when.toLocaleString()}`, onclick: () => playRecording(t) });
+  return h("li", { class: `clip${isPlaying ? " playing" : ""}` },
+    h("time", { text: withDay ? `${when.toLocaleDateString([], { weekday: "short" })} ${fmtClock(t.start)}` : fmtClock(t.start) }),
+    h("span", { class: "what" }, label === null ? "" : (label || "Voice"),
+      h("small", { text: `${label === null ? "" : `${mhz(t.freq_hz)} · `}${t.duration.toFixed(1)} s` })),
+    btn);
 }
 
-function playClip(c) {
-  if (playing) { playing.audio.pause(); const same = playing.id === c.id; playing = null; renderClips(); if (same) return; }
-  const audio = new Audio(`/api/clips/${c.id}.wav`);
+function renderClips() {
+  $("clips").replaceChildren(...S.recent.slice(0, 60).map((t) => recordingItem(t, t.label)));
+  $("clips-empty").hidden = S.recent.length > 0;
+}
+
+function playRecording(t) {
+  if (playing) {
+    playing.audio.pause();
+    const same = playing.id === t.id;
+    playing = null;
+    renderClips();
+    if (S.chHistory) renderDetailRecordings();
+    if (same) return;
+  }
+  const audio = new Audio(`/api/recordings/${t.id}.wav`);
   audio.volume = Math.min(1, Number($("volume").value));
-  playing = { id: c.id, audio };
-  audio.addEventListener("ended", () => { playing = null; renderClips(); });
+  playing = { id: t.id, audio };
+  audio.addEventListener("ended", () => { playing = null; renderClips(); if (S.chHistory) renderDetailRecordings(); });
   audio.play().catch(() => toast("That recording is no longer kept.", true));
   renderClips();
+  if (S.chHistory) renderDetailRecordings();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -495,7 +788,9 @@ function applyState(st) {
   const r = st.radio;
   const chipR = $("chip-radio");
   chipR.className = `chip ${r.state === "running" ? "ok" : r.state === "error" ? "bad" : r.state === "connecting" ? "warn" : ""}`;
-  chipR.querySelector(".t").textContent = r.state === "running" ? `Radio · ${mhz(r.config.center_hz)} MHz` : r.state === "error" ? "Radio problem" : r.config.running ? "Radio connecting" : "Radio off";
+  const center = (r.window[0] + r.window[1]) / 2;
+  chipR.querySelector(".t").textContent = r.state === "running" ? `${r.config.mode === "scan" ? "Scanning" : "Radio"} · ${mhz(center)} MHz`
+    : r.state === "error" ? "Radio problem" : r.config.running ? "Radio connecting" : "Radio off";
   chipR.title = r.message || r.device || "";
   const total = Object.values(st.messages).reduce((x, y) => x + y, 0);
   $("chip-msgs").querySelector(".t").textContent = `Messages · ${total}`;
@@ -532,7 +827,7 @@ function connect(delay = 500) {
     if (m.type === "hello") {
       S.trails = new Map(Object.entries(m.trails));
       S.messages = m.messages;
-      S.clips = m.clips;
+      S.recent = m.transmissions;
       applyState(m.state);
       setAircraft(m.aircraft);
       renderMessages();
@@ -549,10 +844,11 @@ function connect(delay = 500) {
       if (S.messages.length > 1000) S.messages.length = 1000;
       renderMessages();
       if (m.message.aircraft === S.selected) renderCard();
-    } else if (m.type === "clip") {
-      S.clips.unshift(m.clip);
-      if (S.clips.length > 300) S.clips.length = 300;
+    } else if (m.type === "transmission") {
+      S.recent.unshift(m.transmission);
+      if (S.recent.length > 300) S.recent.length = 300;
       renderClips();
+      scheduleChannels();
     }
   };
   ws.onclose = () => {
@@ -566,20 +862,30 @@ function connect(delay = 500) {
 // ---------------------------------------------------------------------------------------------
 // wiring
 // ---------------------------------------------------------------------------------------------
+const TABS = ["traffic", "radio", "channels", "messages"];
 function showTab(name) {
-  for (const t of ["traffic", "radio", "messages"]) {
+  for (const t of TABS) {
     $(`tab-${t}`).setAttribute("aria-selected", String(t === name));
     $(`pane-${t}`).hidden = t !== name;
   }
   if (name === "radio") drawSpectrum();
+  if (name === "channels") loadChannels();
+  if (name !== "channels" && document.querySelector(".layout").classList.contains("wide")) setWide(false);
   try { localStorage.setItem("airdesk-tab", name); } catch { /* storage may be unavailable */ }
 }
 
+function setWide(on) {
+  document.querySelector(".layout").classList.toggle("wide", on);
+  $("ch-expand").setAttribute("aria-pressed", String(on));
+  $("ch-expand").textContent = on ? "Collapse" : "Expand";
+  setTimeout(() => { map.invalidateSize(); if (S.chHistory) drawTimeline(); }, 50);
+}
+
 function init() {
-  for (const t of ["traffic", "radio", "messages"]) $(`tab-${t}`).addEventListener("click", () => showTab(t));
+  for (const t of TABS) $(`tab-${t}`).addEventListener("click", () => showTab(t));
   let saved = "traffic";
   try { saved = localStorage.getItem("airdesk-tab") || "traffic"; } catch { /* ignore */ }
-  showTab(saved);
+  showTab(TABS.includes(saved) ? saved : "traffic");
 
   $("ac-search").addEventListener("input", renderTable);
   $("ac-pos").addEventListener("change", renderTable);
@@ -602,7 +908,9 @@ function init() {
     });
   }
 
+  // radio
   $("r-toggle").addEventListener("click", () => act(S.state && S.state.radio.config.running ? "/api/radio/stop" : "/api/radio/start", {}));
+  for (const b of $("mode").querySelectorAll("button")) b.addEventListener("click", () => act("/api/radio/mode", { mode: b.dataset.mode }));
   $("r-center").addEventListener("change", () => act("/api/radio/settings", { center_mhz: Number($("r-center").value) }));
   let gainTimer;
   $("r-gain").addEventListener("input", () => {
@@ -612,12 +920,50 @@ function init() {
   });
   $("keep-clips").addEventListener("change", () => act("/api/radio/settings", { keep_clips: $("keep-clips").checked }));
   $("volume").addEventListener("input", () => { if (gainNode) gainNode.gain.value = Number($("volume").value); });
+  window.addEventListener("resize", () => { drawSpectrum(); if (S.chHistory && !$("pane-channels").hidden) drawTimeline(); });
+
+  // channels
+  for (const b of $("ch-filter").querySelectorAll("button")) {
+    b.addEventListener("click", () => {
+      S.chStatus = b.dataset.status;
+      for (const o of $("ch-filter").querySelectorAll("button")) o.setAttribute("aria-pressed", String(o === b));
+      renderChannels();
+    });
+  }
+  $("ch-search").addEventListener("input", renderChannels);
+  $("ch-expand").addEventListener("click", () => setWide(!document.querySelector(".layout").classList.contains("wide")));
   $("add-chan").addEventListener("submit", async (e) => {
     e.preventDefault();
     const st = await act("/api/channels", { freq_mhz: Number($("add-freq").value), label: $("add-label").value });
-    if (st) { $("add-chan").reset(); toast("Channel added."); }
+    if (st) { $("add-chan").reset(); toast("Channel added."); loadChannels(); }
   });
-  window.addEventListener("resize", drawSpectrum);
+  const saveLabel = async () => {
+    const c = S.chHistory && S.chHistory.channel;
+    if (!c || $("d-label").value.trim() === (c.label || "")) return;
+    if (await act(`/api/channels/${encodeURIComponent(c.id)}`, { label: $("d-label").value.trim() })) { toast("Renamed."); loadChannels(); }
+  };
+  $("d-label").addEventListener("change", saveLabel);
+  $("d-label").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("d-label").blur(); } });
+  $("d-pin").addEventListener("click", async () => {
+    const c = S.chHistory && S.chHistory.channel;
+    if (c && await act(`/api/channels/${encodeURIComponent(c.id)}`, { pinned: !c.pinned })) loadChannels();
+  });
+  $("d-listen").addEventListener("click", () => { if (S.chSelected) toggleListen(S.chSelected); });
+  $("d-delete").addEventListener("click", async () => {
+    const c = S.chHistory && S.chHistory.channel;
+    if (!c || !window.confirm(`Delete ${c.label || mhz(c.freq_hz) + " MHz"} and all its recordings?`)) return;
+    if (await act(`/api/channels/${encodeURIComponent(c.id)}`, undefined, "DELETE")) {
+      S.listen.delete(c.id);
+      S.chSelected = null;
+      S.chHistory = null;
+      loadChannels();
+    }
+  });
+  $("d-close").addEventListener("click", () => { S.chSelected = null; S.chHistory = null; renderChannels(); });
+  for (const b of $("d-range").querySelectorAll("button")) {
+    b.addEventListener("click", () => { S.chHours = Number(b.dataset.hours); S.chBucket = null; loadHistory(); });
+  }
+  $("d-showall").addEventListener("click", () => { S.chBucket = null; drawTimeline(); renderDetailRecordings(); });
 
   // account
   api("/api/me").then((me) => { $("who").textContent = me.user; }).catch(() => {});
@@ -632,7 +978,7 @@ function init() {
     catch (ex) { $("pw-error").textContent = ex.message; }
   });
 
-  setInterval(() => { if (S.state) renderClips(); }, 30000);
+  setInterval(() => { if (S.state) renderClips(); if (!$("pane-channels").hidden) loadChannels(); }, 20000);
   connect();
 }
 

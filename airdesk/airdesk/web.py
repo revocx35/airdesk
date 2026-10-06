@@ -19,7 +19,8 @@ from sdrcommon.webauth import install_auth
 from . import __version__
 from .adsb import AdsbFeed
 from .messages import MessageLog
-from .radio import Channel, ConfigStore, RadioConfig, RadioEngine, new_channel_id
+from .radio import ConfigStore, RadioConfig, RadioEngine
+from .store import Store
 
 STATIC = Path(__file__).parent / "static"
 DEFAULT_TILES = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
@@ -54,6 +55,16 @@ class ChannelIn(BaseModel):
     squelch_db: float = Field(8.0, ge=3, le=30)
 
 
+class ChannelEdit(BaseModel):
+    label: str | None = Field(None, max_length=40)
+    squelch_db: float | None = Field(None, ge=3, le=30)
+    pinned: bool | None = None
+
+
+class Mode(BaseModel):
+    mode: str = Field(pattern="^(scan|fixed)$")
+
+
 class Preset(BaseModel):
     name: str
 
@@ -71,7 +82,9 @@ def create_app(feed: AdsbFeed | None = None, engine: RadioEngine | None = None, 
     if engine is None:
         defaults = RadioConfig(host=env("AIRDESK_SPYSERVER_HOST", "127.0.0.1"),
                                port=int(env("AIRDESK_SPYSERVER_PORT", "5555")))
-        engine = RadioEngine(ConfigStore(data / "radio.json", defaults), messages)
+        recordings = Store(data, retention_days=float(env("AIRDESK_RECORDING_DAYS", "7")),
+                           max_mb=float(env("AIRDESK_RECORDING_MAX_MB", "4000")))
+        engine = RadioEngine(ConfigStore(data / "radio.json", defaults), messages, recordings)
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
@@ -95,7 +108,7 @@ def create_app(feed: AdsbFeed | None = None, engine: RadioEngine | None = None, 
 
     def state() -> dict:
         return {"adsb": feed.status_snapshot(), "radio": engine.snapshot(),
-                "messages": dict(messages.counts), "clips": len(engine.clips),
+                "messages": dict(messages.counts),
                 "presets": {k: v["label"] for k, v in PRESETS.items()}, "tiles": tiles}
 
     @app.get("/", include_in_schema=False)
@@ -114,16 +127,57 @@ def create_app(feed: AdsbFeed | None = None, engine: RadioEngine | None = None, 
     def get_messages(aircraft: str = "", limit: int = 200):
         return messages.list(aircraft, min(max(limit, 1), 1000))
 
-    @app.get("/api/clips")
-    def clips():
-        return engine.clips_list()
+    def channel_rows(status: str = "all") -> list[dict]:
+        now = time.time()
+        starts = engine.rec.recent_starts(now - 86400)
+        rows = []
+        for c in engine.channels():
+            if status != "all" and c["status"] != status:
+                continue
+            hours = [0] * 24
+            for t in starts.get(c["id"], []):
+                hours[min(23, int((now - t) // 3600))] += 1
+            rows.append({**c, "last_24h": hours[::-1], "tx_24h": sum(hours)})
+        return rows
 
-    @app.get("/api/clips/{clip_id}.wav")
-    def clip_wav(clip_id: int):
-        c = engine.clip(clip_id)
+    def label_of(cid: str) -> str:
+        c = engine.rec.channel(cid)
+        return (c["label"] or f"{c['freq_hz'] / 1e6:.3f}") if c else cid
+
+    @app.get("/api/channels")
+    def list_channels(status: str = "all"):
+        return channel_rows(status)
+
+    @app.get("/api/channels/{cid}/history")
+    def channel_history(cid: str, hours: int = 24):
+        c = engine.rec.channel(cid)
         if c is None:
+            raise HTTPException(404, "No such channel")
+        hours = min(max(hours, 1), 24 * 7)
+        since = time.time() - hours * 3600
+        coverage = engine.rec.coverage(c["freq_hz"], since)
+        now, cur = time.time(), engine.current_dwell()
+        if cur and cur[1] <= c["freq_hz"] <= cur[2]:              # listening to it right now
+            coverage.append((cur[0], now))
+        return {"channel": c, "since": since, "until": now,
+                "transmissions": engine.rec.transmissions(cid, since, 5000), "coverage": coverage}
+
+    @app.get("/api/recordings")
+    def recordings(limit: int = 150):
+        rows = engine.rec.transmissions(None, 0, min(max(limit, 1), 500))
+        return [{**r, "label": label_of(r["channel_id"])} for r in rows]
+
+    @app.get("/api/recordings/{tid}.wav")
+    def recording_wav(tid: int):
+        data = engine.rec.wav(tid)
+        if data is None:
             raise HTTPException(404, "That recording is no longer kept.")
-        return Response(c.wav(), media_type="audio/wav", headers={"Cache-Control": "private, max-age=3600"})
+        return Response(data, media_type="audio/wav", headers={"Cache-Control": "private, max-age=86400"})
+
+    @app.post("/api/radio/mode")
+    def radio_mode(body: Mode):
+        engine.update(mode=body.mode)
+        return state()
 
     @app.post("/api/radio/start")
     def radio_start():
@@ -150,31 +204,29 @@ def create_app(feed: AdsbFeed | None = None, engine: RadioEngine | None = None, 
         engine.update(center_hz=PRESETS[body.name]["center_hz"])
         return state()
 
-    @app.post("/api/channels")
-    def add_channel(body: ChannelIn):
-        f = round(body.freq_mhz * 1e6)
-        if any(abs(c.freq_hz - f) < 1e3 for c in engine.cfg.channels):
-            raise HTTPException(400, f"{body.freq_mhz:.3f} MHz is already a channel")
-        engine.set_channels([*engine.cfg.channels, Channel(new_channel_id(), f, body.label.strip(), body.squelch_db)])
+    def changed(fn, *args, **kw):
+        try:
+            fn(*args, **kw)
+        except KeyError as e:
+            raise HTTPException(404, "No such channel") from e
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
         return state()
 
+    @app.post("/api/channels")
+    def add_channel(body: ChannelIn):
+        return changed(engine.add_channel, round(body.freq_mhz * 1e6), body.label.strip(), body.squelch_db)
+
     @app.post("/api/channels/{cid}")
-    def edit_channel(cid: str, body: ChannelIn):
-        chans = list(engine.cfg.channels)
-        for i, c in enumerate(chans):
-            if c.id == cid:
-                chans[i] = Channel(cid, round(body.freq_mhz * 1e6), body.label.strip(), body.squelch_db)
-                engine.set_channels(chans)
-                return state()
-        raise HTTPException(404, "No such channel")
+    def edit_channel(cid: str, body: ChannelEdit):
+        fields = body.model_dump(exclude_none=True)
+        if "label" in fields:
+            fields["label"] = fields["label"].strip()
+        return changed(engine.update_channel, cid, **fields)
 
     @app.delete("/api/channels/{cid}")
     def delete_channel(cid: str):
-        chans = [c for c in engine.cfg.channels if c.id != cid]
-        if len(chans) == len(engine.cfg.channels):
-            raise HTTPException(404, "No such channel")
-        engine.set_channels(chans)
-        return state()
+        return changed(engine.delete_channel, cid)
 
     @app.websocket("/ws")
     async def live(ws: WebSocket):
@@ -193,13 +245,14 @@ def create_app(feed: AdsbFeed | None = None, engine: RadioEngine | None = None, 
             loop.call_soon_threadsafe(put)
 
         on_msg = lambda m: push("message", m)
-        on_clip = lambda c: push("clip", c.public())
+        on_tx = lambda t: push("transmission", {**t, "label": label_of(t["channel_id"])})
         messages.subscribe(on_msg)
-        engine.on_clip(on_clip)
+        engine.on_transmission(on_tx)
         listen: set[str] = set()
+        viewer = id(ws)
         await ws.send_text(json.dumps({"type": "hello", "state": state(), "aircraft": feed.snapshot(),
                                        "trails": feed.trails_snapshot(), "messages": messages.list(limit=150),
-                                       "clips": engine.clips_list()[:150]}))
+                                       "transmissions": recordings(150)}))
 
         async def receiver():
             nonlocal listen
@@ -207,6 +260,7 @@ def create_app(feed: AdsbFeed | None = None, engine: RadioEngine | None = None, 
                 data = await ws.receive_json()
                 if isinstance(data, dict) and isinstance(data.get("listen"), list):
                     listen = {str(x) for x in data["listen"][:20]}
+                    engine.set_listening(viewer, listen)
 
         rx = asyncio.create_task(receiver())
         seq = engine.audio_seq
@@ -247,8 +301,8 @@ def create_app(feed: AdsbFeed | None = None, engine: RadioEngine | None = None, 
         finally:
             rx.cancel()
             messages.unsubscribe(on_msg)
-            with contextlib.suppress(ValueError):
-                engine._clip_listeners.remove(on_clip)
+            engine.off_transmission(on_tx)
+            engine.set_listening(viewer, set())
 
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
     return app

@@ -103,10 +103,14 @@ class VoiceChannel:
         self._hang = 0.0
         self._agc = 1e-3
         self._clip: list[np.ndarray] = []
-        self._clip_start = 0.0
+        self._clip_start = float("inf")
         self._clip_peak = -120.0
         self._hp = signal.butter(2, [250, 3200], btype="bandpass", fs=rate, output="sos")
         self._zi = signal.sosfilt_zi(self._hp) * 0.0
+
+    def prime(self, snr_db: float) -> None:
+        """Start on a transmission already under way: put the floor snr_db below the first level seen."""
+        self._prime = snr_db
 
     def process(self, iq: np.ndarray, now: float) -> tuple[np.ndarray, Clip | None]:
         """Returns (int16 audio, silent while squelched; finished clip or None)."""
@@ -115,7 +119,9 @@ class VoiceChannel:
         env = np.abs(iq)
         p = float(np.mean(env ** 2)) + 1e-20
         self.level_db = 10 * np.log10(p)
-        if self.floor is None:
+        if getattr(self, "_prime", None) is not None:
+            self.floor, self._prime = self.level_db - self._prime, None
+        elif self.floor is None:
             self.floor = self.level_db
         if not self.open:                                     # follow the noise floor while closed
             a = 0.02 if self.level_db > self.floor else 0.2
@@ -151,9 +157,10 @@ class VoiceChannel:
     def _finish(self) -> Clip | None:
         audio = np.concatenate(self._clip)
         self._clip = []
+        start, self._clip_start = self._clip_start, float("inf")
         if self._active_n < 0.35 * self.rate:                 # clicks and noise blips are not transmissions
             return None
-        return Clip(next(VoiceChannel._ids), self.id, self.freq_hz, self._clip_start,
+        return Clip(next(VoiceChannel._ids), self.id, self.freq_hz, start,
                     self._clip_peak - (self.floor or 0), audio[: self._active_n + int(0.1 * self.rate)])
 
 

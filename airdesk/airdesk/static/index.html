@@ -52,6 +52,7 @@
     <nav class="tabs" role="tablist">
       <button role="tab" id="tab-traffic" aria-controls="pane-traffic" aria-selected="true">Traffic <span id="n-traffic" class="count"></span></button>
       <button role="tab" id="tab-radio" aria-controls="pane-radio" aria-selected="false">Radio <span id="n-live" class="live" hidden>●</span></button>
+      <button role="tab" id="tab-channels" aria-controls="pane-channels" aria-selected="false">Channels <span id="n-chans" class="count"></span></button>
       <button role="tab" id="tab-messages" aria-controls="pane-messages" aria-selected="false">Messages <span id="n-msgs" class="count"></span></button>
     </nav>
 
@@ -86,35 +87,37 @@
       </section>
 
       <section class="block">
-        <h3>Window</h3>
-        <div class="row wrap">
-          <div id="presets" class="segmented" role="group" aria-label="Presets"></div>
-        </div>
-        <div class="row wrap">
-          <label class="grow">Centre (MHz) <input id="r-center" type="number" step="0.025" min="24" max="1800"></label>
-          <label class="grow">Gain step <output id="r-gain-out"></output>
+        <div class="row between wrap">
+          <div id="mode" class="segmented" role="group" aria-label="Mode">
+            <button type="button" data-mode="scan" aria-pressed="false">Scan airband</button>
+            <button type="button" data-mode="fixed" aria-pressed="false">Fixed window</button>
+          </div>
+          <label class="gain">Gain <output id="r-gain-out"></output>
             <input id="r-gain" type="range" min="0" max="29" step="1"></label>
         </div>
+        <div id="scan-box">
+          <p id="scan-status" class="scan-status"></p>
+          <div id="scan-strip" class="scan-strip" role="list" aria-label="Airband segments by activeness"></div>
+          <div class="scan-axis" aria-hidden="true"><span>118</span><span>127.5</span><span>137 MHz</span></div>
+          <p class="hint">Darker segments are busier: the scanner spends more time there. Listening to a channel holds the scanner on it.</p>
+          <div id="scan-tip" class="tooltip" role="tooltip" hidden></div>
+        </div>
+        <div id="fixed-box" hidden>
+          <div class="row wrap">
+            <div id="presets" class="segmented" role="group" aria-label="Presets"></div>
+            <label class="grow">Centre (MHz) <input id="r-center" type="number" step="0.025" min="24" max="1800"></label>
+          </div>
+        </div>
         <canvas id="spectrum" height="96" aria-label="Spectrum of the radio window"></canvas>
-        <p class="hint">The dongle hears <span id="r-window"></span> at once. Channels outside it are greyed out.</p>
+        <p class="hint">Now hearing <span id="r-window"></span>.</p>
       </section>
 
       <section class="block">
         <div class="row between">
-          <h3>Voice channels</h3>
+          <h3>Voice in this window</h3>
           <label class="vol">Volume <input id="volume" type="range" min="0" max="1.5" step="0.05" value="0.9"></label>
         </div>
         <ul id="voice-list" class="chanlist"></ul>
-        <form id="add-chan" class="row wrap add-form" autocomplete="off">
-          <input id="add-freq" type="number" step="0.005" min="24" max="1800" placeholder="MHz" aria-label="Frequency in MHz" required>
-          <input id="add-label" type="text" maxlength="40" placeholder="Name, e.g. Approach" aria-label="Channel name">
-          <button type="submit">Add channel</button>
-        </form>
-        <div class="row between">
-          <h3>Heard recently</h3>
-          <span class="muted small-text">signals seen in the window, last 30 min</span>
-        </div>
-        <ul id="activity" class="activity"></ul>
       </section>
 
       <section class="block">
@@ -125,12 +128,67 @@
 
       <section class="block">
         <div class="row between">
-          <h3>Transmissions</h3>
-          <label class="check"><input type="checkbox" id="keep-clips"> Keep recent ones</label>
+          <h3>Latest transmissions</h3>
+          <label class="check"><input type="checkbox" id="keep-clips"> Record</label>
         </div>
+        <p id="rec-usage" class="hint"></p>
         <ol id="clips" class="clips"></ol>
-        <p id="clips-empty" class="hint">Transmissions on voice channels appear here.</p>
+        <p id="clips-empty" class="hint">Voice transmissions appear here as they are recorded.</p>
       </section>
+    </div>
+
+    <div id="pane-channels" role="tabpanel" class="pane channels-pane" hidden>
+      <div class="toolbar">
+        <div id="ch-filter" class="segmented" role="group" aria-label="Show">
+          <button type="button" data-status="alive" aria-pressed="true">Alive <span id="n-alive" class="count"></span></button>
+          <button type="button" data-status="dead" aria-pressed="false">Dead <span id="n-dead" class="count"></span></button>
+          <button type="button" data-status="all" aria-pressed="false">All</button>
+        </div>
+        <input id="ch-search" type="search" placeholder="Name or MHz" aria-label="Filter channels">
+        <button type="button" id="ch-expand" class="ghost expand" aria-pressed="false">Expand</button>
+      </div>
+      <div class="ch-body">
+        <div class="ch-listcol">
+          <ul id="ch-list" class="ch-list"></ul>
+          <p id="ch-empty" class="hint" hidden>No channels yet. In scan mode the radio finds them by itself, or add one below.</p>
+          <form id="add-chan" class="row wrap add-form" autocomplete="off">
+            <input id="add-freq" type="number" step="0.005" min="24" max="1800" placeholder="MHz" aria-label="Frequency in MHz" required>
+            <input id="add-label" type="text" maxlength="40" placeholder="Name, e.g. Approach" aria-label="Channel name">
+            <button type="submit">Add channel</button>
+          </form>
+        </div>
+        <section id="ch-detail" class="ch-detail" aria-live="polite" hidden>
+          <header class="row between wrap">
+            <div class="grow">
+              <input id="d-label" class="title-input" type="text" maxlength="40" aria-label="Channel name" placeholder="Unnamed channel">
+              <div id="d-sub" class="muted small-text"></div>
+            </div>
+            <div class="row">
+              <button type="button" id="d-listen" class="small">Listen</button>
+              <button type="button" id="d-pin" class="small ghost" aria-pressed="false">Pin</button>
+              <button type="button" id="d-delete" class="small ghost danger">Delete</button>
+              <button type="button" id="d-close" class="small ghost" aria-label="Close details">✕</button>
+            </div>
+          </header>
+          <dl id="d-stats" class="facts"></dl>
+          <div class="row between">
+            <h3 id="d-chart-title">Transmissions per 30 minutes</h3>
+            <div id="d-range" class="segmented" role="group" aria-label="Time range">
+              <button type="button" data-hours="24" aria-pressed="true">24 h</button>
+              <button type="button" data-hours="168" aria-pressed="false">7 days</button>
+            </div>
+          </div>
+          <div id="d-chart" class="chart"></div>
+          <p class="hint"><span class="cov-key"></span> The strip under the axis marks when the radio was listening to this channel; gaps mean it was elsewhere.</p>
+          <div class="row between">
+            <h3>Recordings</h3>
+            <button type="button" id="d-showall" class="small ghost" hidden>Show all</button>
+          </div>
+          <p id="d-rec-filter" class="hint" hidden></p>
+          <ol id="d-recs" class="clips"></ol>
+          <p id="d-recs-empty" class="hint" hidden>No recordings in this period.</p>
+        </section>
+      </div>
     </div>
 
     <div id="pane-messages" role="tabpanel" class="pane" hidden>

@@ -13,7 +13,8 @@ from fake_spyserver import FS, FakeSpyServer
 from airdesk import acars, vdl2
 from airdesk.adsb import AdsbFeed, Tar1090Db
 from airdesk.messages import MessageLog
-from airdesk.radio import Channel, ConfigStore, RadioConfig, RadioEngine
+from airdesk.radio import ConfigStore, RadioConfig, RadioEngine
+from airdesk.store import Store
 from airdesk.web import create_app
 from sdrcommon.auth import LoginThrottle, Sessions, UserStore
 
@@ -97,67 +98,77 @@ def test_messages_link_to_aircraft():
 
 
 # -- radio -------------------------------------------------------------------------------------
-class Scene:
-    """A voice transmission on 131.000 MHz and an ACARS burst on 131.525 MHz, repeating every 3 s."""
+def speech_am(seconds: float, fs: float, carrier: float = 0.15) -> np.ndarray:
+    """AM with a syllable-like envelope (4 Hz) on a 600 Hz tone, like speech on a keyed carrier."""
+    t = np.arange(int(seconds * fs)) / fs
+    env = 0.45 * (1 + np.sin(2 * np.pi * 4 * t))
+    return (carrier * (1 + env * np.sin(2 * np.pi * 600 * t))).astype(np.complex64)
 
-    def __init__(self):
-        self.n = 0
-        t = np.arange(int(1.2 * FS)) / FS
-        self.voice = (0.15 * (1 + 0.6 * np.sin(2 * np.pi * 600 * t))).astype(np.complex64)
-        frame = acars.encode("2", "N123AB", "H1", "4", text="AIRDESK TEST MESSAGE", msg_num="D05A", flight="TST75")
-        self.burst = acars.modulate(frame, FS) * 0.4
+
+class Scene:
+    """Signals at given airband frequencies, each repeating with a period: [(freq, signal, start_s, period_s)]."""
+
+    def __init__(self, items):
+        self.n, self.items = 0, items
 
     def __call__(self, center, n):
         k = self.n + np.arange(n)
         self.n += n
-        t = k % int(3 * FS)
         x = (np.random.default_rng(self.n).normal(0, 0.004, 2 * n)).astype(np.float32).view(np.complex64)
-        for f, sig, start in ((131.0e6, self.voice, int(0.2 * FS)), (131.525e6, self.burst, int(1.8 * FS))):
-            idx = t - start
+        for f, sig, start, period in self.items:
+            if abs(f - center) > FS / 2:
+                continue
+            idx = (k % int(period * FS)) - int(start * FS)
             ok = (idx >= 0) & (idx < len(sig))
             if ok.any():
                 x[ok] += sig[idx[ok]] * np.exp(2j * np.pi * (f - center) * k[ok] / FS).astype(np.complex64)
         return x
 
 
+def default_scene():
+    frame = acars.encode("2", "N123AB", "H1", "4", text="AIRDESK TEST MESSAGE", msg_num="D05A", flight="TST75")
+    return Scene([(131.0e6, speech_am(1.2, FS), 0.2, 3.0), (131.525e6, acars.modulate(frame, FS) * 0.4, 1.8, 3.0)])
+
+
 @pytest.fixture
 def radio_parts(tmp_path):
-    srv = FakeSpyServer(Scene())
+    srv = FakeSpyServer(default_scene())
     feed = AdsbFeed("http://example/tar1090", fetch=fake_fetch())
     feed.update(AIRCRAFT)
     log = MessageLog(feed.find)
-    cfg = RadioConfig(host="127.0.0.1", port=srv.port, center_hz=131.2e6, gain=20, vdl2=False,
-                      channels=[Channel("c1", 131.0e6, "Test voice", 8.0), Channel("far", 118.1e6, "Tower")])
-    engine = RadioEngine(ConfigStore(tmp_path / "radio.json", cfg), log)
+    cfg = RadioConfig(host="127.0.0.1", port=srv.port, mode="fixed", center_hz=131.2e6, gain=20, vdl2=False)
+    engine = RadioEngine(ConfigStore(tmp_path / "radio.json", cfg), log, Store(tmp_path))
+    engine.add_channel(131.0e6, "Test voice")
+    engine.add_channel(118.1e6, "Tower")
     yield srv, feed, log, engine
     engine.shutdown()
     srv.close()
 
 
-def test_engine_hears_voice_and_decodes_acars(radio_parts):
+def test_engine_records_voice_and_decodes_acars(radio_parts):
     srv, feed, log, engine = radio_parts
     engine.start()
     msg = wait_for(lambda: next((m for m in log.list() if m["source"] == "ACARS"), None))
     assert (msg["reg"], msg["flight"], msg["text"], msg["aircraft"]) == ("N123AB", "TST75", "AIRDESK TEST MESSAGE", "a1b2c3")
-    clip = wait_for(lambda: engine.clips_list())[0]
-    assert clip["channel"] == "c1" and 0.9 < clip["duration"] < 1.6
+    tx = wait_for(lambda: engine.rec.transmissions())[0]
+    voice = next(c for c in engine.channels() if c["label"] == "Test voice")
+    assert tx["channel_id"] == voice["id"] and 0.9 < tx["duration"] < 1.6
+    assert engine.rec.wav(tx["id"])[:4] == b"RIFF"
     snap = engine.snapshot()
-    views = {v["id"]: v for v in snap["channels"]}
-    assert views["c1"]["inside"] and not views["far"]["inside"]
-    assert views["acars-131525000"]["inside"] and not views["vdl2-136975000"]["inside"]
-    assert snap["state"] == "running" and "RTL-SDR" in snap["device"] and srv.hellos[-1] == "airdesk"
-    assert any(abs(a["freq_hz"] - 131.0e6) < 6e3 for a in snap["activity"])
-    assert engine.clip(clip["id"]).wav()[:4] == b"RIFF"
-    # retune: the settings reach the radio and the window follows
+    views = {v["label"]: v for v in snap["channels"]}
+    assert views["Test voice"]["inside"] and not views["Tower"]["inside"]
+    assert snap["state"] == "running" and srv.hellos[-1] == "airdesk" and snap["scanner"]["current"] is None
+    assert not [c for c in engine.channels() if c["source"] == "detected"]   # the voice is already a channel
     engine.update(center_hz=136.4e6, gain=12)
     wait_for(lambda: srv.settings[-1].get(101) == 136_400_000 and srv.settings[-1].get(2) == 12)
-    wait_for(lambda: {v["id"]: v for v in engine.snapshot()["channels"]}["vdl2-136975000"]["inside"])
-    assert json.loads((engine.store.path).read_text())["center_hz"] == 136.4e6
+    assert json.loads(engine.store.path.read_text())["center_hz"] == 136.4e6
+    engine.stop()
+    assert engine.rec.coverage(131.0e6, 0)                                    # listening time was booked
 
 
 def test_engine_reports_unreachable_radio(tmp_path):
     cfg = RadioConfig(host="127.0.0.1", port=1)
-    engine = RadioEngine(ConfigStore(tmp_path / "r.json", cfg), MessageLog())
+    engine = RadioEngine(ConfigStore(tmp_path / "r.json", cfg), MessageLog(), Store(tmp_path))
     engine.start()
     try:
         st = wait_for(lambda: engine.snapshot()["state"] == "error" and engine.snapshot())
@@ -165,6 +176,15 @@ def test_engine_reports_unreachable_radio(tmp_path):
     finally:
         engine.stop()
     assert engine.snapshot()["state"] == "stopped"
+
+
+def test_old_channel_list_moves_into_the_store(tmp_path):
+    (tmp_path / "radio.json").write_text(json.dumps({"center_hz": 131.2e6, "channels": [
+        {"id": "c1", "freq_hz": 131.0e6, "label": "Approach", "squelch_db": 9.0}]}))
+    engine = RadioEngine(ConfigStore(tmp_path / "radio.json", RadioConfig()), MessageLog(), Store(tmp_path))
+    c = engine.channels()[0]
+    assert (c["label"], c["pinned"], c["source"], c["squelch_db"]) == ("Approach", 1, "manual", 9.0)
+    assert json.loads((tmp_path / "radio.json").read_text())["channels"] == []
 
 
 def test_vdl2_bridge_plumbing(tmp_path):
@@ -203,30 +223,42 @@ def test_web_app(radio_parts, tmp_path):
         assert c.get("/api/state").json()["tiles"]["url"].startswith("https://tile.openstreetmap.org/")
         assert {a["hex"] for a in c.get("/api/aircraft").json()["aircraft"]} == {"a1b2c3", "a00001", "abcdef"}
         r = c.post("/api/channels", json={"freq_mhz": 130.975, "label": "Approach"})
-        assert r.status_code == 200 and any(ch["label"] == "Approach" for ch in r.json()["radio"]["channels"])
+        assert r.status_code == 200
         assert c.post("/api/channels", json={"freq_mhz": 130.975}).status_code == 400
-        cid = next(ch["id"] for ch in engine.snapshot()["channels"] if ch["label"] == "Approach")
+        rows = {x["label"]: x for x in c.get("/api/channels").json()}
+        assert rows["Approach"]["pinned"] == 1 and len(rows["Approach"]["last_24h"]) == 24
+        cid = rows["Approach"]["id"]
+        assert c.post(f"/api/channels/{cid}", json={"label": "APP", "pinned": False}).status_code == 200
+        assert next(x for x in c.get("/api/channels").json() if x["id"] == cid)["label"] == "APP"
         assert c.delete(f"/api/channels/{cid}").status_code == 200
-        assert c.post("/api/radio/preset", json={"name": "acars"}).json()["radio"]["config"]["center_hz"] == 131.2e6
+        assert c.delete(f"/api/channels/{cid}").status_code == 404
+        assert c.post("/api/radio/mode", json={"mode": "sideways"}).status_code == 422
         assert c.post("/api/radio/settings", json={"center_mhz": 5000}).status_code == 422
         c.post("/api/radio/start")
+        voice = rows["Test voice"]["id"]
         with c.websocket_connect("/ws", headers={"origin": "http://testserver"}) as ws:
             hello = ws.receive_json()
-            assert hello["type"] == "hello" and len(hello["aircraft"]) == 3
-            ws.send_json({"listen": ["c1"]})
+            assert hello["type"] == "hello" and len(hello["aircraft"]) == 3 and "transmissions" in hello
+            ws.send_json({"listen": [voice]})
             kinds, audio = set(), 0
             end = time.monotonic() + 12
-            while time.monotonic() < end and not ({"message", "clip"} <= kinds and audio > 5):
+            while time.monotonic() < end and not ({"message", "transmission"} <= kinds and audio > 5):
                 m = ws.receive()
                 if m.get("bytes"):
                     audio += 1
-                    assert m["bytes"][:1] == b"\x01"
                 elif m.get("text"):
                     kinds.add(json.loads(m["text"])["type"])
-            assert {"state", "aircraft", "message", "clip"} <= kinds and audio > 5
-        clip = c.get("/api/clips").json()[0]
-        assert c.get(f"/api/clips/{clip['id']}.wav").headers["content-type"] == "audio/wav"
+            assert {"state", "aircraft", "message", "transmission"} <= kinds and audio > 5
+            assert engine.listening() == {voice}
+        wait_for(lambda: engine.listening() == set())
+        rec = c.get("/api/recordings").json()[0]
+        assert rec["label"] == "Test voice"
+        assert c.get(f"/api/recordings/{rec['id']}.wav").headers["content-type"] == "audio/wav"
+        hist = c.get(f"/api/channels/{voice}/history", params={"hours": 24}).json()
+        assert hist["transmissions"] and hist["channel"]["label"] == "Test voice"
+        assert hist["coverage"] and hist["coverage"][-1][1] >= hist["until"] - 1      # includes listening right now
         assert c.get("/api/messages", params={"aircraft": "a1b2c3"}).json()[0]["reg"] == "N123AB"
+        assert c.post("/api/radio/mode", json={"mode": "scan"}).json()["radio"]["config"]["mode"] == "scan"
         c.post("/api/radio/stop")
 
 
