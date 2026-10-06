@@ -240,8 +240,34 @@ class Store:
                 "DELETE FROM channels WHERE status = 'dead' AND pinned = 0 AND coalesce(last_heard, created) < ? "
                 "AND id NOT IN (SELECT DISTINCT channel_id FROM transmissions)", (cutoff,)).rowcount
         self._unlink(old + over)
+        merged = self.merge_duplicates()
         self._prune_empty_days()
-        return {"expired": len(old), "trimmed": len(over), "retired": retired, "forgotten": forgotten}
+        return {"expired": len(old), "trimmed": len(over), "retired": retired, "forgotten": forgotten, "merged": merged}
+
+    def merge_duplicates(self, within_hz: float = 25e3, same_time_s: float = 2.5) -> int:
+        """Remove found channels that only ever transmitted together with a busier neighbour: one wide
+        signal spilling over several raster steps, not separate stations."""
+        removed = 0
+        with self._lock:
+            chans = [dict(r) for r in self.db.execute("SELECT * FROM channels ORDER BY tx_count DESC, freq_hz")]
+            starts = {c["id"]: [r[0] for r in self.db.execute("SELECT start FROM transmissions WHERE channel_id = ?", (c["id"],))]
+                      for c in chans}
+        gone = set()
+        for c in chans:
+            if c["source"] != "detected" or c["pinned"] or not starts[c["id"]]:
+                continue
+            for other in chans:
+                if other["id"] == c["id"] or other["id"] in gone or abs(other["freq_hz"] - c["freq_hz"]) > within_hz:
+                    continue
+                if other["tx_count"] < c["tx_count"] or (other["tx_count"] == c["tx_count"] and other["freq_hz"] > c["freq_hz"]):
+                    continue
+                theirs = starts[other["id"]]
+                if all(any(abs(t - u) <= same_time_s for u in theirs) for t in starts[c["id"]]):
+                    self.delete_channel(c["id"])
+                    gone.add(c["id"])
+                    removed += 1
+                    break
+        return removed
 
     def usage_bytes(self) -> int:
         with self._lock:

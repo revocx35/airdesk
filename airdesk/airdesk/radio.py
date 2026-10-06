@@ -545,6 +545,9 @@ class _Session:
         pid = f"new-{int(snap(b.freq))}"
         if pid in self.prov:
             return
+        for cid, v in self.voices.items():                 # a known channel next door is talking: it is that one
+            if v.open and abs(v.freq_hz - b.freq) <= 25e3:
+                return
         v = VoiceChannel(pid, snap(b.freq), 8.0)
         v.prime(b.snr_db)
         self.prov[pid] = _Provisional(b.freq, v)

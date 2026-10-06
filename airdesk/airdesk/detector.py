@@ -96,6 +96,34 @@ class VoiceDetector:
         spec = np.fft.fftshift(np.abs(np.fft.fft(x[: n * self.N].reshape(n, self.N) * win, axis=1)) ** 2, axes=1).mean(0)
         return 10 * np.log10(np.array([spec[s].sum() for s in self._bins]) + 1e-20)
 
+    NEIGHBOURS = 3              # raster steps (25 kHz) within which simultaneous activity is one signal
+    BROADBAND = 5               # a run of more active steps than this (> ~40 kHz) is interference, not voice
+
+    def _not_a_new_channel(self, lv: np.ndarray, snr: np.ndarray) -> np.ndarray:
+        """Steps that may not start a burst: part of a wider signal, spill-over from a stronger or already
+        active neighbour, or broadband interference."""
+        n = len(lv)
+        hot = snr > self.HOLD_DB
+        busy = np.array([f in self.active for f in self._freqs], bool)
+        blocked = np.zeros(n, bool)
+        i = 0
+        while i < n:                                          # runs of adjacent active steps
+            if not hot[i]:
+                i += 1
+                continue
+            j = i
+            while j + 1 < n and hot[j + 1]:
+                j += 1
+            if j - i + 1 > self.BROADBAND:
+                blocked[i:j + 1] = True
+            i = j + 1
+        for i in range(n):
+            lo, hi = max(0, i - self.NEIGHBOURS), min(n, i + self.NEIGHBOURS + 1)
+            near = [k for k in range(lo, hi) if k != i and hot[k]]
+            if any(busy[k] for k in near) or any(lv[k] > lv[i] or (lv[k] == lv[i] and k < i) for k in near):
+                blocked[i] = True
+        return blocked
+
     def process(self, x: np.ndarray, now: float, dt: float) -> tuple[list[Burst], list[Burst]]:
         """Returns (bursts that started, bursts that ended) in this chunk."""
         if self._skip:
@@ -107,15 +135,11 @@ class VoiceDetector:
         new = np.isnan(floors)
         floors[new] = lv[new]
         snr = lv - floors
-        # a strong channel splatters into its neighbours; only count local maxima
-        louder = np.zeros(len(lv), bool)
-        for d in (1, 2):
-            louder[d:] |= lv[:-d] > lv[d:] + 6
-            louder[:-d] |= lv[d:] > lv[:-d] + 6
+        blocked = self._not_a_new_channel(lv, snr)
         for i, f in enumerate(self._freqs):
             b = self.active.get(f)
             if b is None:
-                if snr[i] > self.OPEN_DB and not louder[i] and not new[i]:
+                if snr[i] > self.OPEN_DB and not blocked[i] and not new[i]:
                     b = self.active[f] = Burst(f, now - dt, float(snr[i]))
                     started.append(b)
                 else:                                     # follow the floor: quickly down, slowly up

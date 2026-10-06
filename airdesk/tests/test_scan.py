@@ -211,3 +211,40 @@ def test_broadcasts_do_not_hold_the_scanner():
     # the session reports "transmitting" only for transmissions younger than LONG_TX_S
     assert not sch.should_move(scanner.MAX_DWELL + 1, True, False)
     assert sch.should_move(scanner.MAX_DWELL + 1, False, False)
+
+
+def test_a_signal_wider_than_one_step_is_one_channel():
+    f = snap(125.725e6)
+    wide = speech_am(1.5, FS)
+    # the same transmission seen on three neighbouring steps at nearly the same level
+    started, ended = run_detector([(f, wide, 0.5), (f + RASTER, wide * 0.9, 0.5), (f - RASTER, wide * 0.85, 0.5)],
+                                  center=125.4e6)
+    assert [round(b.freq) for b in started] == [round(f)]
+
+
+def test_broadband_interference_is_not_a_channel():
+    rng = np.random.default_rng(3)
+    burst = (rng.normal(0, 0.05, int(1.5 * FS)) + 1j * rng.normal(0, 0.05, int(1.5 * FS))).astype(np.complex64)
+    from scipy import signal as sig
+    taps = sig.firwin(255, 30e3, fs=FS)                         # ~60 kHz wide noise burst
+    burst = sig.lfilter(taps, 1, burst).astype(np.complex64) * 4
+    started, _ = run_detector([(snap(124.6e6), burst, 0.5)])
+    assert started == []
+
+
+def test_store_merges_spill_over_channels(tmp_path):
+    clock = Clock()
+    st = Store(tmp_path, clock=clock)
+    pcm = np.zeros(8000, np.int16)
+    st.add_channel("main", 125.725e6, source="detected")
+    st.add_channel("spill", 125.725e6 + RASTER, source="detected")
+    st.add_channel("own", 125.725e6 + 2 * RASTER, source="detected")
+    st.add_channel("pin", 125.725e6 - RASTER, source="detected", pinned=True)
+    for t in (100, 200, 300):
+        st.add_transmission("main", 125.725e6, clock.t - t, pcm, 8000, 10)
+    for t in (100.4, 199.8):
+        st.add_transmission("spill", 125.733e6, clock.t - t, pcm, 8000, 8)
+        st.add_transmission("pin", 125.717e6, clock.t - t, pcm, 8000, 8)
+    st.add_transmission("own", 125.742e6, clock.t - 150, pcm, 8000, 9)              # talks on its own
+    assert st.maintain()["merged"] == 1
+    assert {c["id"] for c in st.channels()} == {"main", "own", "pin"}
