@@ -89,7 +89,7 @@ def test_everything_but_sign_in_is_closed(client):
     assert client.post("/api/do").status_code == 401
     assert "Testapp" in client.get("/login").text
     assert client.get("/auth/login.js").status_code == 200
-    assert client.get("/api/login-info").json() == {"has_users": True, "app": "Testapp"}
+    assert client.get("/api/login-info").json() == {"has_users": True, "app": "Testapp", "setup_allowed": False}
     with pytest.raises(Exception):
         with client.websocket_connect("/ws", headers={"origin": "http://testserver"}):
             pass
@@ -181,3 +181,77 @@ def test_users_cli(tmp_path):
     assert run("list").stdout.split() == ["zoe"]
     assert run("add", "yan", "--password-stdin", stdin="short\n").returncode == 1
     assert json.loads((tmp_path / "users.json").read_text())["users"]["zoe"]["hash"].startswith("scrypt$")
+
+
+def fresh_app(tmp_path, monkeypatch=None, setup_from=None):
+    if monkeypatch and setup_from:
+        monkeypatch.setenv("TESTAPP_SETUP_FROM", setup_from)
+    users = UserStore(tmp_path / "fresh.json")
+    app = FastAPI()
+    install_auth(app, app_name="Testapp", prefix="TESTAPP", users=users, sessions=Sessions(users),
+                 throttle=LoginThrottle())
+
+    @app.get("/api/data")
+    def data():
+        return {"secret": 42}
+    return app, users
+
+
+def test_first_visitor_on_the_lan_creates_the_admin(tmp_path):
+    app, users = fresh_app(tmp_path)
+    with TestClient(app, headers=H, client=("192.168.1.20", 50000)) as c:
+        assert c.get("/api/login-info").json() == {"has_users": False, "app": "Testapp", "setup_allowed": True}
+        assert c.post("/api/setup", json={"username": "boss", "password": "short"}).status_code == 400
+        assert c.post("/api/setup", json={"username": "bad name", "password": PW}).status_code == 400
+        r = c.post("/api/setup", json={"username": "boss", "password": PW})
+        assert r.status_code == 200 and "samesite=strict" in r.headers["set-cookie"].lower()
+        assert c.get("/api/data").json() == {"secret": 42}                    # signed in straight away
+        again = c.post("/api/setup", json={"username": "mallory", "password": PW})
+        assert again.status_code == 409 and "already exists" in again.json()["detail"]
+        assert c.get("/api/login-info").json()["setup_allowed"] is False
+    assert users.names() == ["boss"] and users.verify("boss", PW)
+
+
+def test_setup_is_refused_from_the_internet_by_default(tmp_path, monkeypatch):
+    app, users = fresh_app(tmp_path)
+    with TestClient(app, headers=H, client=("8.8.8.8", 50000)) as c:
+        assert c.get("/api/login-info").json()["setup_allowed"] is False
+        r = c.post("/api/setup", json={"username": "boss", "password": PW})
+        assert r.status_code == 403 and "local network" in r.json()["detail"]
+        assert c.post("/api/setup", json={"username": "boss", "password": PW}, headers={"X-App-Request": ""}).status_code == 403
+    assert users.names() == []
+    app2, users2 = fresh_app(tmp_path / "any", monkeypatch, "any")
+    with TestClient(app2, headers=H, client=("8.8.8.8", 50000)) as c:
+        assert c.post("/api/setup", json={"username": "boss", "password": PW}).status_code == 200
+
+
+def test_only_one_first_account_even_when_racing(tmp_path):
+    import threading
+    users = UserStore(tmp_path / "race.json")
+    results = []
+    def go(name):
+        try:
+            users.add_first(name, PW)
+            results.append(name)
+        except AccountError:
+            pass
+    threads = [threading.Thread(target=go, args=(f"u{i}",)) for i in range(6)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert len(results) == 1 and users.names() == results
+
+
+def test_login_page_offers_setup(tmp_path):
+    app, _ = fresh_app(tmp_path)
+    with TestClient(app, client=("192.168.1.20", 50000)) as c:
+        page = c.get("/login").text
+        assert 'id="setup"' in page and "Create the admin account" in page and "Testapp" in page
+
+
+@pytest.mark.parametrize("ip, ok", [("192.168.1.30", True), ("10.1.2.3", True), ("172.20.0.5", True), ("127.0.0.1", True),
+                                     ("::1", True), ("fd00::5", True), ("8.8.8.8", False), ("100.64.1.1", False),
+                                     ("2001:4860::8888", False), ("172.32.0.1", False)])
+def test_which_addresses_may_set_up(tmp_path, ip, ok):
+    app, _ = fresh_app(tmp_path)
+    with TestClient(app, client=(ip, 50000)) as c:
+        assert c.get("/api/login-info").json()["setup_allowed"] is ok

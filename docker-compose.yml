@@ -16,8 +16,7 @@ services:
       SPYSWITCH_HTTP_PORT: ${SPYSWITCH_HTTP_PORT:-8096}
       SPYSWITCH_DEFAULT_ALLOW: ${SPYSWITCH_DEFAULT_ALLOW:-true}
       SPYSWITCH_TRUSTED_PROXIES: ${SPYSWITCH_TRUSTED_PROXIES:-private}
-      SPYSWITCH_ADMIN_USER: ${SPYSWITCH_ADMIN_USER:-}
-      SPYSWITCH_ADMIN_PASSWORD: ${SPYSWITCH_ADMIN_PASSWORD:-}
+      SPYSWITCH_SETUP_FROM: ${SPYSWITCH_SETUP_FROM:-private}           # who may create the first account
     volumes:
       - spyswitch-data:/data
 
@@ -39,8 +38,7 @@ services:
       AIRDESK_RECEIVER_LON: ${AIRDESK_RECEIVER_LON:-}
       AIRDESK_HTTP_PORT: ${AIRDESK_HTTP_PORT:-8097}
       AIRDESK_TRUSTED_PROXIES: ${AIRDESK_TRUSTED_PROXIES:-private}
-      AIRDESK_ADMIN_USER: ${AIRDESK_ADMIN_USER:-}
-      AIRDESK_ADMIN_PASSWORD: ${AIRDESK_ADMIN_PASSWORD:-}
+      AIRDESK_SETUP_FROM: ${AIRDESK_SETUP_FROM:-private}               # who may create the first account
     volumes:
       - airdesk-data:/data
 

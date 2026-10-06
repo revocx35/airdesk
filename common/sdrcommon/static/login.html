@@ -9,16 +9,27 @@
 <body>
 <main class="box">
   <p class="app">{{APP}}</p>
-  <form id="login" class="card" autocomplete="on">
+  <form id="login" class="card" autocomplete="on" hidden>
     <h1>Sign in</h1>
     <label>Username <input id="username" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required maxlength="64"></label>
     <label>Password <input id="password" name="password" type="password" autocomplete="current-password" required maxlength="1024"></label>
     <button type="submit" id="submit">Sign in</button>
     <p id="error" class="error" role="alert"></p>
   </form>
-  <div id="setup" class="card" hidden>
-    <h1>No accounts yet</h1>
-    <p>Create the first account on the machine running {{APP}}:</p>
+  <form id="setup" class="card" autocomplete="off" hidden>
+    <h1>Create the admin account</h1>
+    <p class="lead">{{APP}} has no accounts yet. The account you create now can sign in and manage it.</p>
+    <label>Username <input id="s-username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required maxlength="32" pattern="[A-Za-z0-9._\-]{1,32}" value="admin"></label>
+    <label>Password <input id="s-password" type="password" autocomplete="new-password" required minlength="10" maxlength="256"></label>
+    <label>Repeat password <input id="s-repeat" type="password" autocomplete="new-password" required minlength="10" maxlength="256"></label>
+    <p class="hint">At least 10 characters. Username: letters, digits, dots, dashes or underscores.</p>
+    <button type="submit" id="s-submit">Create account and sign in</button>
+    <p id="s-error" class="error" role="alert"></p>
+  </form>
+  <div id="remote" class="card" hidden>
+    <h1>Set up from your network</h1>
+    <p>{{APP}} has no accounts yet. For safety, the first account can only be created from a device on the same local network.</p>
+    <p class="hint">Or create it on the machine running {{APP}}:</p>
     <pre id="setup-cmd">docker compose exec SERVICE python -m sdrcommon.users add NAME</pre>
   </div>
 </main>

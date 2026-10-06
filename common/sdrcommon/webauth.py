@@ -1,12 +1,15 @@
 """Sign-in for a FastAPI app: pages, API, session middleware, security headers.
 
-Everything except the sign-in page and /healthz needs a session. Writes need the
+Everything except the sign-in page and /healthz needs a session. While no account exists, the
+sign-in page offers to create the first one; by default only to visitors on a private network, so an
+app reachable from the internet cannot be claimed by a stranger before its owner sets it up. Writes need the
 X-App-Request header (browsers cannot add it cross-site without CORS) and are refused
 when the browser marks them cross-site. WebSockets check Origin against Host.
 """
 from __future__ import annotations
 
 import html
+import ipaddress
 import logging
 import math
 import os
@@ -26,6 +29,8 @@ COOKIE = "sdr_session"
 HEADER = "x-app-request"
 UNSAFE = {"POST", "PUT", "PATCH", "DELETE"}
 PRIVATE_NETWORKS = "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1,fc00::/7"
+# where a first-run setup may come from: private ranges, loopback and link-local
+LOCAL_NETS = [ipaddress.ip_network(n) for n in (*PRIVATE_NETWORKS.split(","), "169.254.0.0/16", "fe80::/10")]
 
 
 def trusted_proxies(prefix: str) -> str:
@@ -35,6 +40,11 @@ def trusted_proxies(prefix: str) -> str:
 
 
 class _Login(BaseModel):
+    username: str = Field(max_length=64)
+    password: str = Field(max_length=1024)
+
+
+class _Setup(BaseModel):
     username: str = Field(max_length=64)
     password: str = Field(max_length=1024)
 
@@ -77,13 +87,24 @@ def install_auth(app: FastAPI, *, app_name: str, prefix: str, users: UserStore |
     throttle = throttle or LoginThrottle()
     sessions = sessions or Sessions(users, max_age_s=float(env(f"{prefix}_SESSION_DAYS", "7")) * 86400)
     secure_mode = env(f"{prefix}_SECURE_COOKIES", "auto").lower()
+    setup_from = env(f"{prefix}_SETUP_FROM", "private").lower()
     auth = Auth(users, sessions, throttle,
-                public={"/login", "/api/login", "/api/login-info", "/healthz", "/auth/login.js", "/auth/login.css",
-                        *(public or set())})
+                public={"/login", "/api/login", "/api/login-info", "/api/setup", "/healthz", "/auth/login.js",
+                        "/auth/login.css", *(public or set())})
     extra_csp = extra_csp or {}
 
     def secure(request: Request) -> bool:
         return secure_mode == "true" or (secure_mode == "auto" and request.url.scheme == "https")
+
+    def may_set_up(request: Request) -> bool:
+        """First-run setup is offered to private-network visitors (or anyone with *_SETUP_FROM=any)."""
+        if setup_from == "any":
+            return True
+        try:
+            ip = ipaddress.ip_address(request.client.host if request.client else "")
+        except ValueError:
+            return False
+        return any(ip in net for net in LOCAL_NETS)
 
     def csp(host: str) -> str:
         parts = {
@@ -145,8 +166,9 @@ def install_auth(app: FastAPI, *, app_name: str, prefix: str, users: UserStore |
         return FileResponse(STATIC / "login.css", media_type="text/css")
 
     @app.get("/api/login-info")
-    def login_info():
-        return {"has_users": bool(users.names()), "app": app_name}
+    def login_info(request: Request):
+        has_users = bool(users.names())
+        return {"has_users": has_users, "app": app_name, "setup_allowed": not has_users and may_set_up(request)}
 
     def start_session(request: Request, resp: Response, user: str) -> None:
         resp.set_cookie(COOKIE, sessions.create(user), max_age=int(sessions.max_age), httponly=True,
@@ -168,6 +190,21 @@ def install_auth(app: FastAPI, *, app_name: str, prefix: str, users: UserStore |
         throttle.succeeded(ip, body.username)
         start_session(request, response, body.username)
         return {"user": body.username}
+
+    @app.post("/api/setup")
+    def setup(body: _Setup, request: Request, response: Response):
+        if users.names():
+            return JSONResponse({"detail": "An account already exists. Sign in instead."}, status_code=409)
+        if not may_set_up(request):
+            return JSONResponse({"detail": "The first account can only be created from your local network."},
+                                status_code=403)
+        try:
+            users.add_first(body.username.strip(), body.password)
+        except AccountError as e:
+            return JSONResponse({"detail": str(e)}, status_code=409 if "already exists" in str(e) else 400)
+        log.info("first account %s created from %s", body.username[:64], request.client.host if request.client else "?")
+        start_session(request, response, body.username.strip())
+        return {"user": body.username.strip()}
 
     @app.post("/api/logout")
     def logout(request: Request, response: Response):

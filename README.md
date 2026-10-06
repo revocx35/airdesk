@@ -31,12 +31,8 @@ Presets: **VDL2** (window around 136.4 MHz: VDL2 plus upper airband voice) and *
    ```sh
    docker compose up -d            # or: docker compose up -d --build
    ```
-4. **Create accounts** (passwords need 10+ characters):
-   ```sh
-   docker compose exec airdesk python -m sdrcommon.users add NAME
-   docker compose exec spyswitch python -m sdrcommon.users add NAME
-   ```
-5. Open Airdesk on port **8097** and SpySwitch on **8096**. Clients like SDR# and SDR++ keep using ports 5555/5556 as before.
+4. **Open each app:** Airdesk on port **8097**, SpySwitch on **8096**. On the first visit each asks you to create its admin account (password 10+ characters). For safety this only works from your local network; from anywhere else it explains how to create the account on the server instead.
+5. Clients like SDR# and SDR++ keep using ports 5555/5556 as before.
 
 ### Settings
 
@@ -52,7 +48,7 @@ Presets: **VDL2** (window around 136.4 MHz: VDL2 plus upper airband voice) and *
 | `*_HTTP_PORT` | `8097` / `8096` | Web ports |
 | `*_TRUSTED_PROXIES` | `private` | Proxies whose `X-Forwarded-For`/`-Proto` are believed: `private`, `none`, or IPs/CIDRs |
 | `*_SECURE_COOKIES` | `auto` | Secure cookie when reached over HTTPS; `true`/`false` to force |
-| `*_ADMIN_USER` / `*_ADMIN_PASSWORD` | – | Optional first account, created at start-up if missing |
+| `*_SETUP_FROM` | `private` | Who may create the first account while none exists: `private` (local networks) or `any` |
 
 ## SpySwitch
 
@@ -65,6 +61,13 @@ SpyServer clients send their name when they connect (`SDR#`, `SDR++`, `airdesk`,
 The switches organise who gets the radio; they are not a security boundary, since a client could send another app's name.
 
 ## Accounts and security
+
+The first visitor creates the admin account (from a private network unless `*_SETUP_FROM=any`); after that the page only offers sign-in. More accounts, password resets and removals are done on the server:
+
+```sh
+docker compose exec airdesk python -m sdrcommon.users add NAME       # or: passwd NAME, remove NAME, list
+docker compose exec spyswitch python -m sdrcommon.users add NAME
+```
 
 Accounts are stored as scrypt hashes in each app's data volume. Failed sign-ins are limited per address (10), per account (5) and overall (100) per 15 minutes. Sessions are HttpOnly, SameSite=Strict cookies; API writes need an `X-App-Request` header and are refused when the browser marks them cross-site, WebSockets check their Origin, and pages are served with a strict Content-Security-Policy.
 

@@ -105,6 +105,19 @@ class UserStore:
             self._users[name] = {"hash": h, "created": int(time.time())}
             self._save()
 
+    def add_first(self, name: str, password: str) -> None:
+        """Create an account only if none exists yet (first-run setup); two racing requests cannot both win."""
+        if not NAME_RE.match(name):
+            raise AccountError("Usernames are 1-32 letters, digits, dots, dashes or underscores")
+        check_password_rules(password)
+        h = hash_password(password)
+        with self._lock:
+            self._load()
+            if self._users:
+                raise AccountError("An account already exists. Sign in instead.")
+            self._users[name] = {"hash": h, "created": int(time.time())}
+            self._save()
+
     def set_password(self, name: str, password: str) -> None:
         check_password_rules(password)
         h = hash_password(password)
