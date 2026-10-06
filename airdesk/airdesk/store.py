@@ -144,6 +144,14 @@ class Store:
     def add_transmission(self, channel_id: str, freq_hz: float, start: float, pcm12k: np.ndarray, rate: int,
                          level_db: float) -> dict:
         audio = signal.resample_poly(pcm12k.astype(np.float64), FILE_RATE, rate) if rate != FILE_RATE else pcm12k
+        duration = len(audio) / FILE_RATE
+        with self._lock:                                  # the same transmission caught twice: keep the longer
+            twin = self.db.execute("SELECT * FROM transmissions WHERE channel_id = ? AND abs(start - ?) < 1.5",
+                                   (channel_id, start)).fetchone()
+        if twin is not None:
+            if twin["duration"] >= duration:
+                return dict(twin)
+            self.delete_transmission(twin["id"])
         data = mulaw_encode(np.clip(audio, -32767, 32767))
         day = time.strftime("%Y-%m-%d", time.gmtime(start))
         (self.rec_dir / day).mkdir(exist_ok=True)
@@ -158,6 +166,15 @@ class Store:
             self.db.execute("UPDATE channels SET last_heard = max(coalesce(last_heard, 0), ?), tx_count = tx_count + 1, "
                             "status = 'alive' WHERE id = ?", (start, channel_id))
         return self.transmission(tid)
+
+    def delete_transmission(self, tid: int) -> None:
+        with self._lock:
+            r = self.db.execute("SELECT channel_id, file FROM transmissions WHERE id = ?", (tid,)).fetchone()
+            if r is None:
+                return
+            self.db.execute("DELETE FROM transmissions WHERE id = ?", (tid,))
+            self.db.execute("UPDATE channels SET tx_count = max(tx_count - 1, 0) WHERE id = ?", (r["channel_id"],))
+        self._unlink([r["file"]])
 
     def transmission(self, tid: int) -> dict | None:
         with self._lock:
@@ -244,9 +261,14 @@ class Store:
         self._prune_empty_days()
         return {"expired": len(old), "trimmed": len(over), "retired": retired, "forgotten": forgotten, "merged": merged}
 
-    def merge_duplicates(self, within_hz: float = 25e3, same_time_s: float = 2.5) -> int:
-        """Remove found channels that only ever transmitted together with a busier neighbour: one wide
-        signal spilling over several raster steps, not separate stations."""
+    def merge_duplicates(self, within_hz: float = 25e3, same_time_s: float = 2.5, same_channel_hz: float = 10e3) -> int:
+        """Tidy found channels that are really part of another channel.
+
+        Within same_channel_hz they are the same channel heard on an offset carrier: their recordings
+        move to the busier one. Up to within_hz, a found channel that only ever transmitted together
+        with a busier neighbour is spill-over from one wide signal and is removed. Empty found channels
+        go too.
+        """
         removed = 0
         with self._lock:
             chans = [dict(r) for r in self.db.execute("SELECT * FROM channels ORDER BY tx_count DESC, freq_hz")]
@@ -254,7 +276,27 @@ class Store:
                       for c in chans}
         gone = set()
         for c in chans:
-            if c["source"] != "detected" or c["pinned"] or not starts[c["id"]]:
+            if c["source"] != "detected" or c["pinned"]:
+                continue
+            if not starts[c["id"]]:
+                self.delete_channel(c["id"])
+                gone.add(c["id"])
+                removed += 1
+                continue
+            twin = next((o for o in chans if o["id"] != c["id"] and o["id"] not in gone
+                         and abs(o["freq_hz"] - c["freq_hz"]) <= same_channel_hz
+                         and (o["tx_count"] > c["tx_count"] or o["pinned"] or o["source"] == "manual"
+                              or (o["tx_count"] == c["tx_count"] and o["freq_hz"] < c["freq_hz"]))), None)
+            if twin is not None:
+                with self._lock:
+                    self.db.execute("UPDATE transmissions SET channel_id = ? WHERE channel_id = ?", (twin["id"], c["id"]))
+                    self.db.execute("UPDATE channels SET tx_count = tx_count + ?, last_heard = max(coalesce(last_heard, 0), ?) "
+                                    "WHERE id = ?", (c["tx_count"], c["last_heard"] or 0, twin["id"]))
+                    self.db.execute("DELETE FROM channels WHERE id = ?", (c["id"],))
+                twin["tx_count"] += c["tx_count"]
+                starts[twin["id"]] += starts[c["id"]]
+                gone.add(c["id"])
+                removed += 1
                 continue
             for other in chans:
                 if other["id"] == c["id"] or other["id"] in gone or abs(other["freq_hz"] - c["freq_hz"]) > within_hz:

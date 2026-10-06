@@ -33,6 +33,7 @@ CHUNK_S = 0.05
 USABLE = 0.42                                           # fraction of the sample rate on each side we trust
 FIXED_DWELL_S = 300.0                                   # how often fixed mode books its listening time
 IGNORE_S = 600.0                                        # how long a frequency that sent a non-voice burst is ignored
+SAME_CHANNEL_HZ = 10e3                                  # offset-carrier transmitters of one channel sit within this
 MAINTAIN_S = 60.0
 
 
@@ -97,7 +98,7 @@ class _Provisional:
     burst_freq: float
     voice: VoiceChannel
     verdict: str = ""                                    # "" until the burst ends, then "voice" or "other"
-    channel_id: str = ""
+    channel_id: str = ""                                 # existing channel within 10 kHz it belongs to, if any
     clips: list = field(default_factory=list)
 
 
@@ -532,7 +533,8 @@ class _Session:
         e = self.e
         if self.ignored.get(b.freq, 0) > e.clock():
             return
-        known = e.rec.find_channel(b.freq)
+        known = e.rec.find_channel(b.freq)                 # exactly this raster step
+        near = known or e.rec.find_channel(b.freq, SAME_CHANNEL_HZ)
         if known is not None:
             if known["status"] == "dead":                 # a retired channel speaks again: bring it back
                 e.rec.update_channel(known["id"], status="alive")
@@ -548,9 +550,9 @@ class _Session:
         for cid, v in self.voices.items():                 # a known channel next door is talking: it is that one
             if v.open and abs(v.freq_hz - b.freq) <= 25e3:
                 return
-        v = VoiceChannel(pid, snap(b.freq), 8.0)
+        v = VoiceChannel(pid, snap(b.freq), 8.0)              # centred on this carrier, so the audio is clean
         v.prime(b.snr_db)
-        self.prov[pid] = _Provisional(b.freq, v)
+        self.prov[pid] = _Provisional(b.freq, v, channel_id=near["id"] if near else "")
         self.rebuild()
 
     def _burst_ended(self, b) -> None:
@@ -561,11 +563,8 @@ class _Session:
         p = self.prov.get(pid)
         if p is None or p.verdict:
             return
-        if b.is_voice and e.rec.find_channel(p.voice.freq_hz) is None:
-            c = e.rec.add_channel(new_channel_id(), p.voice.freq_hz, "", "detected", False, 8.0, rate=0.0)
-            p.verdict, p.channel_id = "voice", c["id"]
-            log.info("found a voice channel on %.3f MHz", p.voice.freq_hz / 1e6)
-            e.refresh_channels()
+        if b.is_voice:
+            p.verdict = "voice"                           # the channel is created once a recording exists
         else:
             p.verdict = "other"
             if not b.cut:                                 # cut short by a retune proves nothing
@@ -578,12 +577,23 @@ class _Session:
         p = self.prov.pop(pid, None)
         if p is None:
             return
-        if p.verdict == "voice":
-            if p.voice.floor is not None:
-                self.floors[p.channel_id] = p.voice.floor
+        if p.verdict == "voice" and p.clips:
+            e = self.e
+            if p.channel_id and e.rec.channel(p.channel_id):
+                c = e.rec.channel(p.channel_id)
+                if c["status"] == "dead":
+                    e.rec.update_channel(c["id"], status="alive")
+            else:                                         # a new channel
+                c = e.rec.add_channel(new_channel_id(), p.voice.freq_hz, "", "detected", False, 8.0, rate=0.0)
+                p.channel_id = c["id"]
+                if p.voice.floor is not None:
+                    self.floors[c["id"]] = p.voice.floor
+                log.info("found a voice channel on %.3f MHz", p.voice.freq_hz / 1e6)
             for clip in p.clips:
                 clip.channel = p.channel_id
+                self.dwell_tx[p.channel_id] += 1
                 self._store_clip(p.channel_id, clip)
+            e.refresh_channels()
         self.rebuild()
 
     def _clip(self, cid: str, clip: Clip) -> None:

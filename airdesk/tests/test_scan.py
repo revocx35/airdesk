@@ -158,7 +158,7 @@ def test_store_size_cap_and_coverage(tmp_path):
     st.add_channel("a", 124.35e6)
     pcm = np.zeros(12000, np.int16)
     for i in range(5):
-        st.add_transmission("a", 124.35e6, clock.t - 100 + i, pcm, 12000, 10.0)
+        st.add_transmission("a", 124.35e6, clock.t - 100 + 5 * i, pcm, 12000, 10.0)
     assert st.maintain()["trimmed"] == 3 and st.usage_bytes() <= 20_000
     st.add_dwell(100, 110, 123e6, 125e6)
     st.add_dwell(111, 120, 123e6, 125e6)                                        # gap < 2 s: one stretch
@@ -237,14 +237,29 @@ def test_store_merges_spill_over_channels(tmp_path):
     st = Store(tmp_path, clock=clock)
     pcm = np.zeros(8000, np.int16)
     st.add_channel("main", 125.725e6, source="detected")
-    st.add_channel("spill", 125.725e6 + RASTER, source="detected")
-    st.add_channel("own", 125.725e6 + 2 * RASTER, source="detected")
-    st.add_channel("pin", 125.725e6 - RASTER, source="detected", pinned=True)
+    st.add_channel("offset", 125.725e6 + RASTER, source="detected")                  # offset carrier, 8.3 kHz
+    st.add_channel("spill", 125.725e6 + 2 * RASTER, source="detected")               # 16.7 kHz, only with main
+    st.add_channel("own", 125.725e6 + 3 * RASTER, source="detected")                 # 25 kHz, talks on its own
+    st.add_channel("empty", 124.0e6, source="detected")
+    st.add_channel("pin", 125.725e6 - 2 * RASTER, source="detected", pinned=True)       # pinned: always kept
     for t in (100, 200, 300):
         st.add_transmission("main", 125.725e6, clock.t - t, pcm, 8000, 10)
+    st.add_transmission("offset", 125.733e6, clock.t - 500, pcm, 8000, 8)
     for t in (100.4, 199.8):
-        st.add_transmission("spill", 125.733e6, clock.t - t, pcm, 8000, 8)
-        st.add_transmission("pin", 125.717e6, clock.t - t, pcm, 8000, 8)
-    st.add_transmission("own", 125.742e6, clock.t - 150, pcm, 8000, 9)              # talks on its own
-    assert st.maintain()["merged"] == 1
+        st.add_transmission("spill", 125.742e6, clock.t - t, pcm, 8000, 8)
+        st.add_transmission("pin", 125.708e6, clock.t - t, pcm, 8000, 8)
+    st.add_transmission("own", 125.750e6, clock.t - 150, pcm, 8000, 9)
+    assert st.maintain()["merged"] == 3
     assert {c["id"] for c in st.channels()} == {"main", "own", "pin"}
+    assert st.channel("main")["tx_count"] == 4 and len(st.transmissions("main")) == 4       # the offset one moved over
+
+
+def test_the_same_transmission_is_kept_once(tmp_path):
+    st = Store(tmp_path, clock=Clock())
+    st.add_channel("a", 125.725e6)
+    short, long = np.zeros(8000, np.int16), np.zeros(16000, np.int16)
+    st.add_transmission("a", 125.725e6, 1000.0, short, 8000, 9)
+    st.add_transmission("a", 125.725e6, 1000.6, long, 8000, 11)                       # caught again, longer
+    st.add_transmission("a", 125.725e6, 1001.0, short, 8000, 9)                       # and again, shorter
+    rows = st.transmissions("a")
+    assert len(rows) == 1 and rows[0]["duration"] == 2.0 and st.channel("a")["tx_count"] == 1
