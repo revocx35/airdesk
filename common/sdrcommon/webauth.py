@@ -25,7 +25,7 @@ from .auth import AccountError, LoginThrottle, Sessions, UserStore
 
 log = logging.getLogger("sdrcommon.auth")
 STATIC = Path(__file__).parent / "static"
-COOKIE = "sdr_session"
+COOKIE = "sdr_session"  # default for Auth; install_auth uses "<prefix>_session"
 HEADER = "x-app-request"
 UNSAFE = {"POST", "PUT", "PATCH", "DELETE"}
 PRIVATE_NETWORKS = "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1,fc00::/7"
@@ -88,7 +88,10 @@ def install_auth(app: FastAPI, *, app_name: str, prefix: str, users: UserStore |
     sessions = sessions or Sessions(users, max_age_s=float(env(f"{prefix}_SESSION_DAYS", "7")) * 86400)
     secure_mode = env(f"{prefix}_SECURE_COOKIES", "auto").lower()
     setup_from = env(f"{prefix}_SETUP_FROM", "private").lower()
-    auth = Auth(users, sessions, throttle,
+    # One name per app: Airdesk and SpySwitch share the host (cookies ignore the port), so a shared name
+    # made signing in to one app sign you out of the other.
+    cookie = f"{prefix.lower()}_session"
+    auth = Auth(users, sessions, throttle, cookie=cookie,
                 public={"/login", "/api/login", "/api/login-info", "/api/setup", "/healthz", "/auth/login.js",
                         "/auth/login.css", *(public or set())})
     extra_csp = extra_csp or {}
@@ -130,7 +133,7 @@ def install_auth(app: FastAPI, *, app_name: str, prefix: str, users: UserStore |
                 return JSONResponse({"detail": "Request refused."}, status_code=403)
         path = request.url.path
         if path not in auth.public:
-            user = sessions.user(request.cookies.get(COOKIE))
+            user = sessions.user(request.cookies.get(cookie))
             if user is None:
                 if path.startswith("/api/"):
                     return JSONResponse({"detail": "Sign in first."}, status_code=401)
@@ -153,7 +156,7 @@ def install_auth(app: FastAPI, *, app_name: str, prefix: str, users: UserStore |
 
     @app.get("/login", include_in_schema=False)
     def login_page(request: Request):
-        if sessions.user(request.cookies.get(COOKIE)):
+        if sessions.user(request.cookies.get(cookie)):
             return RedirectResponse("/", status_code=303)
         return HTMLResponse(login_html)
 
@@ -171,7 +174,7 @@ def install_auth(app: FastAPI, *, app_name: str, prefix: str, users: UserStore |
         return {"has_users": has_users, "app": app_name, "setup_allowed": not has_users and may_set_up(request)}
 
     def start_session(request: Request, resp: Response, user: str) -> None:
-        resp.set_cookie(COOKIE, sessions.create(user), max_age=int(sessions.max_age), httponly=True,
+        resp.set_cookie(cookie, sessions.create(user), max_age=int(sessions.max_age), httponly=True,
                         samesite="strict", secure=secure(request), path="/")
 
     @app.post("/api/login")
@@ -208,8 +211,8 @@ def install_auth(app: FastAPI, *, app_name: str, prefix: str, users: UserStore |
 
     @app.post("/api/logout")
     def logout(request: Request, response: Response):
-        sessions.end(request.cookies.get(COOKIE))
-        response.delete_cookie(COOKIE, path="/", httponly=True, samesite="strict", secure=secure(request))
+        sessions.end(request.cookies.get(cookie))
+        response.delete_cookie(cookie, path="/", httponly=True, samesite="strict", secure=secure(request))
         return {"ok": True}
 
     @app.get("/api/me")

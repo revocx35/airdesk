@@ -255,3 +255,30 @@ def test_which_addresses_may_set_up(tmp_path, ip, ok):
     app, _ = fresh_app(tmp_path)
     with TestClient(app, client=(ip, 50000)) as c:
         assert c.get("/api/login-info").json()["setup_allowed"] is ok
+
+
+def test_apps_on_one_host_keep_separate_session_cookies(tmp_path):
+    """Airdesk and SpySwitch run on the same host (different ports). Cookies ignore the port, so with one
+    shared cookie name signing in to one app replaced the other app's session."""
+    users = UserStore(tmp_path / "users.json")
+    users.add("alice", PW)
+    jar = {}
+    for prefix in ("AIRDESK", "SPYSWITCH"):
+        app = FastAPI()
+        install_auth(app, app_name=prefix, prefix=prefix, users=users, sessions=Sessions(users))
+
+        @app.get("/api/data")
+        def data():
+            return {"ok": True}
+
+        c = TestClient(app)
+        r = c.post("/api/login", json={"username": "alice", "password": PW}, headers=H)
+        assert r.status_code == 200
+        jar.update(c.cookies)
+        jar[prefix] = (app, c)
+    names = [k for k in jar if k not in ("AIRDESK", "SPYSWITCH")]
+    assert len(names) == 2, names
+    for prefix in ("AIRDESK", "SPYSWITCH"):  # the browser sends both cookies to both apps
+        app, _ = jar[prefix]
+        c = TestClient(app, cookies={n: jar[n] for n in names})
+        assert c.get("/api/data").status_code == 200
