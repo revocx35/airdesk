@@ -129,6 +129,7 @@ class RadioEngine:
         self._channels: list[dict] = []
         self._listen: dict[int, set[str]] = {}
         self._lock = threading.Lock()
+        self._control = threading.Lock()                   # start/stop
         self._changed = threading.Event()
         self._reconnect = threading.Event()
         self._stop = threading.Event()
@@ -205,22 +206,27 @@ class RadioEngine:
             return set().union(*self._listen.values()) if self._listen else set()
 
     def start(self) -> None:
-        self.cfg.running = True
-        self.store.save()
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, args=(self._stop,), daemon=True)
-        self._thread.start()
+        # _control: the web layer calls start/stop from parallel request threads (double clicks).
+        with self._control:
+            self.cfg.running = True
+            self.store.save()
+            if self._thread and self._thread.is_alive() and not self._stop.is_set():
+                return
+            # A worker that was told to stop but is still winding down (stop() only waits 5 s) must not
+            # count as running, or this start would be swallowed and the radio stay off.
+            self._stop = threading.Event()
+            self._thread = threading.Thread(target=self._run, args=(self._stop,), daemon=True)
+            self._thread.start()
 
     def stop(self) -> None:
-        self.cfg.running = False
-        self.store.save()
-        self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=5)
-        with self._lock:
-            self.state, self.message, self._views, self.spectrum = "stopped", "", [], None
+        with self._control:
+            self.cfg.running = False
+            self.store.save()
+            self._stop.set()
+            if self._thread:
+                self._thread.join(timeout=5)
+            with self._lock:
+                self.state, self.message, self._views, self.spectrum = "stopped", "", [], None
 
     def shutdown(self) -> None:
         """Stop the worker without changing whether the radio should run next time."""
